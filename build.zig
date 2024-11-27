@@ -11,6 +11,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // GLFW
+    exe.addIncludePath(b.path("third_party/glfw/include"));
+    exe.addObjectFile(b.path("third_party/glfw/lib64/libglfw3.a"));
+
+    exe.linkSystemLibrary("vulkan");
+
+    exe.linkLibC();
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
