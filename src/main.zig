@@ -17,8 +17,9 @@ const Application = struct {
     instance: c.VkInstance,
     physical_device: c.VkPhysicalDevice,
     device: c.VkDevice,
-    debug_messenger: c.VkDebugUtilsMessengerEXT,
     graphics_queue: c.VkQueue,
+    debug_messenger: c.VkDebugUtilsMessengerEXT,
+    surface: c.VkSurfaceKHR,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !Application {
@@ -72,8 +73,13 @@ const Application = struct {
         std.log.info("Init Vulkan", .{});
         try self.create_instance();
         try self.setup_debug_messenger();
+        try self.create_surface();
         try self.pick_physical_device();
         try self.create_logical_device();
+    }
+
+    fn create_surface(self: *Application) !void {
+        _ = self;
     }
 
     fn create_logical_device(self: *Application) !void {
