@@ -15,7 +15,10 @@ const Application = struct {
     window_name: [*c]const u8,
     window: ?*c.GLFWwindow,
     instance: c.VkInstance,
+    physical_device: c.VkPhysicalDevice,
+    device: c.VkDevice,
     debug_messenger: c.VkDebugUtilsMessengerEXT,
+    graphics_queue: c.VkQueue,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !Application {
@@ -32,6 +35,7 @@ const Application = struct {
         if (enable_validation_layers) {
             destroy_debug_util_messenger_ext(self.instance, self.debug_messenger, null);
         }
+        defer c.vkDestroyDevice(self.device, null);
         defer c.vkDestroyInstance(self.instance, null);
         defer c.glfwDestroyWindow(self.window);
         defer c.glfwTerminate();
@@ -43,7 +47,7 @@ const Application = struct {
         try self.main_loop();
     }
 
-    pub fn init_window(self: *Application) !void {
+    fn init_window(self: *Application) !void {
         std.log.info("Init window", .{});
 
         if (c.glfwInit() == c.GLFW_FALSE) {
@@ -64,13 +68,145 @@ const Application = struct {
         self.window = window;
     }
 
-    pub fn init_vulkan(self: *Application) !void {
+    fn init_vulkan(self: *Application) !void {
         std.log.info("Init Vulkan", .{});
         try self.create_instance();
         try self.setup_debug_messenger();
+        try self.pick_physical_device();
+        try self.create_logical_device();
     }
 
-    pub fn create_instance(self: *Application) !void {
+    fn create_logical_device(self: *Application) !void {
+        const indices = try self.find_queue_families(self.physical_device);
+
+        var queue_create_info = c.VkDeviceQueueCreateInfo{
+            .sType = c.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+        };
+
+        if (indices.graphics_family) |graphics_family| {
+            queue_create_info.queueFamilyIndex = graphics_family;
+            queue_create_info.queueCount = 1;
+        }
+
+        var queue_priority: f32 = 1.0;
+        queue_create_info.pQueuePriorities = &queue_priority;
+
+        var device_features = c.VkPhysicalDeviceFeatures{};
+
+        var create_info = c.VkDeviceCreateInfo{};
+        create_info.sType = c.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        create_info.pQueueCreateInfos = &queue_create_info;
+        create_info.queueCreateInfoCount = 1;
+        create_info.pEnabledFeatures = &device_features;
+        create_info.enabledExtensionCount = 0;
+
+        if (enable_validation_layers) {
+            const enabled_layers: []const [*c]const u8 = &validation_layers;
+            create_info.enabledLayerCount = @intCast(enabled_layers.len);
+            create_info.ppEnabledLayerNames = enabled_layers.ptr;
+        } else {
+            create_info.enabledLayerCount = 0;
+        }
+
+        if (c.vkCreateDevice(self.physical_device, &create_info, null, &self.device) != c.VK_SUCCESS) {
+            std.log.err("Failed to create logical device!", .{});
+            return error.Vulkan;
+        }
+
+        if (indices.graphics_family) |graphics_family| {
+            c.vkGetDeviceQueue(self.device, graphics_family, 0, &self.graphics_queue);
+        }
+    }
+
+    fn pick_physical_device(self: *Application) !void {
+        var device_count: u32 = 0;
+        _ = c.vkEnumeratePhysicalDevices(self.instance, &device_count, null);
+
+        if (device_count == 0) {
+            std.log.err("Failed to find GPUs with Vulkan support!", .{});
+            return error.Vulkan;
+        }
+
+        const devices = try self.allocator.alloc(c.VkPhysicalDevice, device_count);
+        defer self.allocator.free(devices);
+        _ = c.vkEnumeratePhysicalDevices(self.instance, &device_count, devices.ptr);
+
+        for (devices) |device| {
+            if (try self.is_device_suitable(device)) {
+                // self.physical_device = self.allocator.dupe(c.VkPhysicalDevice, device);
+                self.physical_device = device;
+                break;
+            }
+        }
+
+        if (self.physical_device == null) {
+            std.log.err("Failed to find a suitable GPU!", .{});
+            return error.Vulkan;
+        }
+    }
+
+    fn is_device_suitable(self: *Application, device: c.VkPhysicalDevice) !bool {
+        // _ = self;
+        // _ = device;
+        var device_properties: c.VkPhysicalDeviceProperties = undefined;
+        c.vkGetPhysicalDeviceProperties(device, &device_properties);
+        // std.debug.print("device_properties: {any}\n", .{device_properties});
+
+        var device_features: c.VkPhysicalDeviceFeatures = undefined;
+        c.vkGetPhysicalDeviceFeatures(device, &device_features);
+        // std.debug.print("device_features: {any}\n", .{device_features});
+
+        var indices = try self.find_queue_families(device);
+
+        if (device_properties.deviceType == c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU and device_features.geometryShader == c.VK_TRUE) {
+            // only dedicated gpus are allowed
+            return indices.is_complete();
+        } else if (device_features.geometryShader == c.VK_TRUE) {
+            return indices.is_complete();
+        } else {
+            return false;
+        }
+    }
+
+    const QueueFamilyIndices = struct {
+        graphics_family: ?u32,
+
+        pub fn init() QueueFamilyIndices {
+            return std.mem.zeroInit(QueueFamilyIndices, .{});
+        }
+
+        pub fn is_complete(self: *QueueFamilyIndices) bool {
+            if (self.graphics_family != null) {
+                return true;
+            } else {
+                return false;
+            }
+        }
+    };
+
+    fn find_queue_families(self: *Application, device: c.VkPhysicalDevice) !QueueFamilyIndices {
+        var indices = QueueFamilyIndices.init();
+
+        var queue_family_count: u32 = 0;
+        _ = c.vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count, null);
+
+        const queue_families = try self.allocator.alloc(c.VkQueueFamilyProperties, queue_family_count);
+        defer self.allocator.free(queue_families);
+        _ = c.vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count, queue_families.ptr);
+
+        for (queue_families, 0..queue_families.len) |queue_family, i| {
+            if (queue_family.queueFlags > 0 and c.VK_QUEUE_GRAPHICS_BIT == 1) {
+                indices.graphics_family = @intCast(i);
+            }
+            if (indices.is_complete()) {
+                break;
+            }
+        }
+
+        return indices;
+    }
+
+    fn create_instance(self: *Application) !void {
         std.log.info("Vulkan: create instance", .{});
         const validation_layer_support = try check_validation_layer_support(self);
         if (enable_validation_layers and !validation_layer_support) {
@@ -191,9 +327,7 @@ const Application = struct {
 
     fn populate_debug_messenger_create_info(create_info: *c.VkDebugUtilsMessengerCreateInfoEXT) void {
         create_info.sType = c.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
-        // create_info.messageSeverity = c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT or c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT or c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
         create_info.messageSeverity = c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT;
-        // create_info.messageType = c.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT or c.VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT or c.VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT;
         create_info.messageType = c.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
         create_info.pfnUserCallback = &debug_callback;
         create_info.pUserData = null;
@@ -230,9 +364,9 @@ const Application = struct {
         }
     }
 
-    pub fn main_loop(self: *Application) !void {
+    fn main_loop(self: *Application) !void {
         std.log.info("Main loop", .{});
-        while (c.glfwWindowShouldClose(self.window) == 0) {
+        while (c.glfwWindowShouldClose(self.window) == c.GLFW_FALSE) {
             c.glfwPollEvents();
         }
     }
