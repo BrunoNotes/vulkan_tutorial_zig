@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) void {
 
     // GLFW
     exe.addIncludePath(b.path("third_party/glfw/include"));
-    exe.addObjectFile(b.path("third_party/glfw/lib64/libglfw3.a"));
+    exe.addObjectFile(b.path("third_party/glfw/build/src/libglfw3.a"));
 
     exe.linkSystemLibrary("vulkan");
 
