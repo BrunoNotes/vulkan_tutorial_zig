@@ -20,6 +20,7 @@ const Application = struct {
     graphics_queue: c.VkQueue,
     debug_messenger: c.VkDebugUtilsMessengerEXT,
     surface: c.VkSurfaceKHR,
+    present_queue: c.VkQueue,
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator) !Application {
@@ -37,6 +38,7 @@ const Application = struct {
             destroy_debug_util_messenger_ext(self.instance, self.debug_messenger, null);
         }
         defer c.vkDestroyDevice(self.device, null);
+        defer c.vkDestroySurfaceKHR(self.instance, self.surface, null);
         defer c.vkDestroyInstance(self.instance, null);
         defer c.glfwDestroyWindow(self.window);
         defer c.glfwTerminate();
@@ -79,30 +81,43 @@ const Application = struct {
     }
 
     fn create_surface(self: *Application) !void {
-        _ = self;
+        if (c.glfwCreateWindowSurface(self.instance, self.window, null, &self.surface) != c.VK_SUCCESS) {
+            std.log.err("Failed to create window surface", .{});
+            return error.Vulkan;
+        }
     }
 
     fn create_logical_device(self: *Application) !void {
         const indices = try self.find_queue_families(self.physical_device);
 
-        var queue_create_info = c.VkDeviceQueueCreateInfo{
-            .sType = c.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        };
+        var queue_create_infos = std.ArrayList(c.VkDeviceQueueCreateInfo).init(self.allocator);
+
+        var unique_queue_families = std.ArrayList(u32).init(self.allocator);
+        defer unique_queue_families.deinit();
 
         if (indices.graphics_family) |graphics_family| {
-            queue_create_info.queueFamilyIndex = graphics_family;
-            queue_create_info.queueCount = 1;
+            try unique_queue_families.append(graphics_family);
+        }
+        if (indices.present_family) |present_family| {
+            try unique_queue_families.append(present_family);
         }
 
-        var queue_priority: f32 = 1.0;
-        queue_create_info.pQueuePriorities = &queue_priority;
+        for (try unique_queue_families.toOwnedSlice()) |queue_family| {
+            var queue_create_info = c.VkDeviceQueueCreateInfo{};
+            queue_create_info.sType = c.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+            queue_create_info.queueFamilyIndex = queue_family;
+            queue_create_info.queueCount = 1;
+            var queue_priority: f32 = 1.0;
+            queue_create_info.pQueuePriorities = &queue_priority;
+            try queue_create_infos.append(queue_create_info);
+        }
 
         var device_features = c.VkPhysicalDeviceFeatures{};
 
         var create_info = c.VkDeviceCreateInfo{};
         create_info.sType = c.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        create_info.pQueueCreateInfos = &queue_create_info;
-        create_info.queueCreateInfoCount = 1;
+        create_info.pQueueCreateInfos = queue_create_infos.items.ptr;
+        create_info.queueCreateInfoCount = @intCast(queue_create_infos.items.len);
         create_info.pEnabledFeatures = &device_features;
         create_info.enabledExtensionCount = 0;
 
@@ -121,6 +136,9 @@ const Application = struct {
 
         if (indices.graphics_family) |graphics_family| {
             c.vkGetDeviceQueue(self.device, graphics_family, 0, &self.graphics_queue);
+        }
+        if (indices.present_family) |present_family| {
+            c.vkGetDeviceQueue(self.device, present_family, 0, &self.present_queue);
         }
     }
 
@@ -176,13 +194,14 @@ const Application = struct {
 
     const QueueFamilyIndices = struct {
         graphics_family: ?u32,
+        present_family: ?u32,
 
         pub fn init() QueueFamilyIndices {
             return std.mem.zeroInit(QueueFamilyIndices, .{});
         }
 
         pub fn is_complete(self: *QueueFamilyIndices) bool {
-            if (self.graphics_family != null) {
+            if (self.graphics_family != null and self.present_family != null) {
                 return true;
             } else {
                 return false;
@@ -201,6 +220,12 @@ const Application = struct {
         _ = c.vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count, queue_families.ptr);
 
         for (queue_families, 0..queue_families.len) |queue_family, i| {
+            var present_support: c.VkBool32 = undefined;
+            _ = c.vkGetPhysicalDeviceSurfaceSupportKHR(device, @intCast(i), self.surface, &present_support);
+
+            if (present_support == c.VK_TRUE) {
+                indices.present_family = @intCast(i);
+            }
             if (queue_family.queueFlags > 0 and c.VK_QUEUE_GRAPHICS_BIT == 1) {
                 indices.graphics_family = @intCast(i);
             }
