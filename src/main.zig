@@ -4,6 +4,7 @@ const c = @import("c.zig").c;
 
 const validation_layers = [_][*c]const u8{"VK_LAYER_KHRONOS_validation"};
 const enable_validation_layers = builtin.mode == .Debug;
+const device_extensions = [_][*c]const u8{c.VK_KHR_SWAPCHAIN_EXTENSION_NAME};
 
 fn GLFW_error_callback(err: c_int, description: [*c]const u8) callconv(.C) void {
     std.log.err("GLFW: Error {d}: {s}", .{ err, description });
@@ -82,7 +83,7 @@ const Application = struct {
 
     fn create_surface(self: *Application) !void {
         if (c.glfwCreateWindowSurface(self.instance, self.window, null, &self.surface) != c.VK_SUCCESS) {
-            std.log.err("Failed to create window surface", .{});
+            std.log.err("Vulkan: Failed to create window surface", .{});
             return error.Vulkan;
         }
     }
@@ -91,6 +92,7 @@ const Application = struct {
         const indices = try self.find_queue_families(self.physical_device);
 
         var queue_create_infos = std.ArrayList(c.VkDeviceQueueCreateInfo).init(self.allocator);
+        defer queue_create_infos.deinit();
 
         var unique_queue_families = std.ArrayList(u32).init(self.allocator);
         defer unique_queue_families.deinit();
@@ -119,7 +121,9 @@ const Application = struct {
         create_info.pQueueCreateInfos = queue_create_infos.items.ptr;
         create_info.queueCreateInfoCount = @intCast(queue_create_infos.items.len);
         create_info.pEnabledFeatures = &device_features;
-        create_info.enabledExtensionCount = 0;
+        const enabled_extensions: []const [*c]const u8 = &device_extensions;
+        create_info.enabledExtensionCount = @intCast(enabled_extensions.len);
+        create_info.ppEnabledExtensionNames = enabled_extensions.ptr;
 
         if (enable_validation_layers) {
             const enabled_layers: []const [*c]const u8 = &validation_layers;
@@ -130,7 +134,7 @@ const Application = struct {
         }
 
         if (c.vkCreateDevice(self.physical_device, &create_info, null, &self.device) != c.VK_SUCCESS) {
-            std.log.err("Failed to create logical device!", .{});
+            std.log.err("Vulkan: Failed to create logical device!", .{});
             return error.Vulkan;
         }
 
@@ -147,7 +151,7 @@ const Application = struct {
         _ = c.vkEnumeratePhysicalDevices(self.instance, &device_count, null);
 
         if (device_count == 0) {
-            std.log.err("Failed to find GPUs with Vulkan support!", .{});
+            std.log.err("Vulkan: Failed to find GPUs with Vulkan support!", .{});
             return error.Vulkan;
         }
 
@@ -164,32 +168,107 @@ const Application = struct {
         }
 
         if (self.physical_device == null) {
-            std.log.err("Failed to find a suitable GPU!", .{});
+            std.log.err("Vulkan: Failed to find a suitable GPU!", .{});
             return error.Vulkan;
         }
     }
 
     fn is_device_suitable(self: *Application, device: c.VkPhysicalDevice) !bool {
-        // _ = self;
-        // _ = device;
         var device_properties: c.VkPhysicalDeviceProperties = undefined;
         c.vkGetPhysicalDeviceProperties(device, &device_properties);
-        // std.debug.print("device_properties: {any}\n", .{device_properties});
 
         var device_features: c.VkPhysicalDeviceFeatures = undefined;
         c.vkGetPhysicalDeviceFeatures(device, &device_features);
-        // std.debug.print("device_features: {any}\n", .{device_features});
 
         var indices = try self.find_queue_families(device);
 
-        if (device_properties.deviceType == c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU and device_features.geometryShader == c.VK_TRUE) {
+        const extensions_supported = try self.check_device_extension_support(device);
+
+        var swap_chain_adequate = false;
+        var swap_chain_support = try self.query_swapchain_support(device);
+        defer swap_chain_support.deinit();
+
+        if (swap_chain_support.formats.len > 0 and swap_chain_support.present_modes.len > 0) {
+            swap_chain_adequate = true;
+        }
+
+        if (device_properties.deviceType == c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU and device_features.geometryShader == c.VK_TRUE and extensions_supported and swap_chain_adequate) {
             // only dedicated gpus are allowed
             return indices.is_complete();
-        } else if (device_features.geometryShader == c.VK_TRUE) {
+        } else if (device_features.geometryShader == c.VK_TRUE and extensions_supported and swap_chain_adequate) {
             return indices.is_complete();
         } else {
             return false;
         }
+    }
+
+    fn check_device_extension_support(self: *Application, device: c.VkPhysicalDevice) !bool {
+        var extension_count: u32 = 0;
+        _ = c.vkEnumerateDeviceExtensionProperties(device, null, &extension_count, null);
+
+        const available_extensions = try self.allocator.alloc(c.VkExtensionProperties, extension_count);
+        defer self.allocator.free(available_extensions);
+        _ = c.vkEnumerateDeviceExtensionProperties(device, null, &extension_count, available_extensions.ptr);
+
+        var required_extensions = std.StringHashMap(void).init(self.allocator);
+        defer required_extensions.deinit();
+
+        for (device_extensions) |extension| {
+            const extension_slice: []const u8 = std.mem.span(extension);
+            try required_extensions.put(extension_slice, {});
+        }
+
+        for (available_extensions) |available_extension| {
+            const extension_c_str: [*c]const u8 = &available_extension.extensionName;
+            _ = required_extensions.remove(std.mem.span(extension_c_str));
+        }
+
+        if (required_extensions.count() == 0) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    const SwapChainSupportDetails = struct {
+        capabilities: c.VkSurfaceCapabilitiesKHR,
+        formats: []c.VkSurfaceFormatKHR,
+        present_modes: []c.VkPresentModeKHR,
+        allocator: std.mem.Allocator,
+
+        pub fn init(allocator: std.mem.Allocator) SwapChainSupportDetails {
+            return std.mem.zeroInit(SwapChainSupportDetails, .{
+                .allocator = allocator,
+            });
+        }
+
+        pub fn deinit(self: *SwapChainSupportDetails) void {
+            defer self.allocator.free(self.formats);
+            defer self.allocator.free(self.present_modes);
+        }
+    };
+
+    fn query_swapchain_support(self: *Application, device: c.VkPhysicalDevice) !SwapChainSupportDetails {
+        var details = SwapChainSupportDetails.init(self.allocator);
+        _ = c.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device, self.surface, &details.capabilities);
+
+        var format_count: u32 = 0;
+        _ = c.vkGetPhysicalDeviceSurfaceFormatsKHR(device, self.surface, &format_count, null);
+
+        if (format_count != 0) {
+            details.formats = try self.allocator.alloc(c.VkSurfaceFormatKHR, format_count);
+            _ = c.vkGetPhysicalDeviceSurfaceFormatsKHR(device, self.surface, &format_count, details.formats.ptr);
+        }
+
+        var present_mode_count: u32 = 0;
+        _ = c.vkGetPhysicalDeviceSurfaceFormatsKHR(device, self.surface, &present_mode_count, null);
+
+        if (present_mode_count != 0) {
+            details.present_modes = try self.allocator.alloc(c.VkPresentModeKHR, present_mode_count);
+            _ = c.vkGetPhysicalDeviceSurfacePresentModesKHR(device, self.surface, &present_mode_count, details.present_modes.ptr);
+        }
+
+        return details;
     }
 
     const QueueFamilyIndices = struct {
@@ -241,7 +320,7 @@ const Application = struct {
         std.log.info("Vulkan: create instance", .{});
         const validation_layer_support = try check_validation_layer_support(self);
         if (enable_validation_layers and !validation_layer_support) {
-            std.log.err("Validation layers requested, but not available!", .{});
+            std.log.err("Vulkan: Validation layers requested, but not available!", .{});
             return error.Vulkan;
         }
 
@@ -278,7 +357,7 @@ const Application = struct {
         }
 
         if (c.vkCreateInstance(&create_info, null, &self.instance) != c.VK_SUCCESS) {
-            std.log.err("Failed to create vulkan instance!", .{});
+            std.log.err("Vulkan: Failed to create vulkan instance!", .{});
             return error.Vulkan;
         }
     }
@@ -334,7 +413,7 @@ const Application = struct {
         if (message_severity >= c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
             // std.debug.print("{any}\n", .{p_callback_data});
             const msg = (p_callback_data orelse return c.VK_TRUE).pMessage orelse return c.VK_TRUE;
-            std.log.warn("Validation layer: {s} ", .{msg});
+            std.log.warn("Vulkan, validation layer: {s} ", .{msg});
         }
 
         return c.VK_FALSE;
@@ -351,7 +430,7 @@ const Application = struct {
 
         const create_debug_util = create_debug_util_messenger_ext(self.instance, &create_info, null, &self.debug_messenger);
         if (create_debug_util != c.VK_SUCCESS) {
-            std.log.err("Failed to set up debug messenger!", .{});
+            std.log.err("Vulkan: Failed to set up debug messenger!", .{});
             return error.Vulkan;
         }
     }
