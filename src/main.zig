@@ -230,6 +230,46 @@ const Application = struct {
         }
     }
 
+    fn choose_swap_surface_format(available_formats: []c.VkSurfaceFormatKHR) c.VkSurfaceFormatKHR {
+        for (available_formats) |available_format| {
+            if (available_format.format == c.VK_FORMAT_B8G8R8A8_SRGB and available_format.colorSpace == c.VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                return available_format;
+            }
+        } else {
+            return available_formats[0];
+        }
+    }
+
+    fn choose_swap_present_mode(available_presents_modes: []c.VkPresentModeKHR) c.VkPresentModeKHR {
+        for (available_presents_modes) |available_present_mode| {
+            if (available_present_mode == c.VK_PRESENT_MODE_MAILBOX_KHR) {
+                return available_present_mode;
+            }
+        } else {
+            return c.VK_PRESENT_MODE_FIFO_KHR;
+        }
+    }
+
+    fn choose_swap_extent(capabilities: c.VkSurfaceCapabilitiesKHR, window: *c.GLFWwindow) c.VkExtent2D {
+        if (capabilities.currentExtent.width != std.math.maxInt(u32)) {
+            return capabilities.currentExtent;
+        } else {
+            var width: u32 = 0;
+            var height: u32 = 0;
+            c.glfwGetFramebufferSize(window, &width, &height);
+
+            var actual_extent = c.VkExtent2D{
+                .width = @intCast(width),
+                .height = @intCast(height),
+            };
+
+            actual_extent.width = std.math.clamp(actual_extent.width, capabilities.minImageExtent.width, capabilities.maxImageExtent.width);
+            actual_extent.height = std.math.clamp(actual_extent.height, capabilities.minImageExtent.height, capabilities.maxImageExtent.height);
+
+            return actual_extent;
+        }
+    }
+
     const SwapChainSupportDetails = struct {
         capabilities: c.VkSurfaceCapabilitiesKHR,
         formats: []c.VkSurfaceFormatKHR,
