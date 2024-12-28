@@ -6,6 +6,7 @@ const vk_dm = @import("debug_messenger.zig");
 const vk_ins = @import("instance.zig");
 const vk_phd = @import("physical_device.zig");
 const vk_ld = @import("logical_device.zig");
+const vk_sc = @import("swap_chain.zig");
 
 pub const validation_layers = [_][*c]const u8{"VK_LAYER_KHRONOS_validation"};
 pub const enable_validation_layers = builtin.mode == .Debug;
@@ -19,6 +20,10 @@ pub const VulkanRenderer = struct {
     debug_messenger: c.VkDebugUtilsMessengerEXT,
     surface: c.VkSurfaceKHR,
     present_queue: c.VkQueue,
+    swap_chain: c.VkSwapchainKHR,
+    swap_chain_images: []c.VkImage,
+    swap_chain_image_format: c.VkFormat,
+    swap_chain_extent: c.VkExtent2D,
     window: ?*c.GLFWwindow,
     allocator: std.mem.Allocator,
 
@@ -33,6 +38,7 @@ pub const VulkanRenderer = struct {
         if (enable_validation_layers) {
             vk_dm.destroy_debug_util_messenger_ext(self.instance, self.debug_messenger, null);
         }
+        defer c.vkDestroySwapchainKHR(self.device, self.swap_chain, null);
         defer c.vkDestroyDevice(self.device, null);
         defer c.vkDestroySurfaceKHR(self.instance, self.surface, null);
         defer c.vkDestroyInstance(self.instance, null);
@@ -48,6 +54,7 @@ pub const VulkanRenderer = struct {
         try self.create_surface();
         try self.pick_physical_device();
         try self.create_logical_device();
+        try self.create_swap_chain();
     }
 
     pub fn create_instance(self: *VulkanRenderer) !void {
@@ -201,5 +208,64 @@ pub const VulkanRenderer = struct {
         if (indices.present_family) |present_family| {
             c.vkGetDeviceQueue(self.device, present_family, 0, &self.present_queue);
         }
+    }
+
+    fn create_swap_chain(self: *VulkanRenderer) !void {
+        const swap_chain_support = try vk_sc.query_swapchain_support(self.allocator, self.physical_device, self.surface);
+
+        const surface_format = vk_sc.choose_swap_surface_format(swap_chain_support.formats);
+        const present_mode = vk_sc.choose_swap_present_mode(swap_chain_support.present_modes);
+        const extent = vk_sc.choose_swap_extent(swap_chain_support.capabilities, self.window);
+
+        var image_count = swap_chain_support.capabilities.minImageCount + 1;
+        if (swap_chain_support.capabilities.maxImageCount > 0 and image_count > swap_chain_support.capabilities.maxImageCount) {
+            image_count = swap_chain_support.capabilities.maxImageCount;
+        }
+
+        var create_info = c.VkSwapchainCreateInfoKHR{};
+        create_info.sType = c.VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+        create_info.surface = self.surface;
+        create_info.minImageCount = image_count;
+        create_info.imageFormat = surface_format.format;
+        create_info.imageColorSpace = surface_format.colorSpace;
+        create_info.imageExtent = extent;
+        create_info.imageArrayLayers = 1;
+        create_info.imageUsage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+        const indices = try vk_phd.find_queue_families(self.allocator, self.physical_device, self.surface);
+
+        const queue_family_indices = [_]u32{ indices.graphics_family.?, indices.present_family.? };
+
+        if (indices.graphics_family != indices.present_family) {
+            create_info.imageSharingMode = c.VK_SHARING_MODE_CONCURRENT;
+            create_info.queueFamilyIndexCount = 2;
+            create_info.pQueueFamilyIndices = &queue_family_indices;
+        } else {
+            create_info.imageSharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
+            create_info.queueFamilyIndexCount = 0; // optional
+            create_info.pQueueFamilyIndices = null; // optional
+        }
+
+        create_info.preTransform = swap_chain_support.capabilities.currentTransform;
+        create_info.compositeAlpha = c.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+        create_info.presentMode = present_mode;
+        create_info.clipped = c.VK_TRUE;
+        // create_info.oldSwapchain = c.VK_NULL_HANDLE;
+        create_info.oldSwapchain = null;
+
+        if (c.vkCreateSwapchainKHR(self.device, &create_info, null, &self.swap_chain) != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to create swap chain!", .{});
+            return error.Vulkan;
+        }
+
+        _ = c.vkGetSwapchainImagesKHR(self.device, self.swap_chain, &image_count, null);
+
+        const swap_chain_images = try self.allocator.alloc(c.VkImage, image_count);
+        defer self.allocator.free(swap_chain_images);
+        _ = c.vkGetSwapchainImagesKHR(self.device, self.swap_chain, &image_count, swap_chain_images.ptr);
+
+        self.swap_chain_images = swap_chain_images;
+        self.swap_chain_image_format = surface_format.format;
+        self.swap_chain_extent = extent;
     }
 };
