@@ -24,6 +24,7 @@ pub const VulkanRenderer = struct {
     swap_chain_images: []c.VkImage,
     swap_chain_image_format: c.VkFormat,
     swap_chain_extent: c.VkExtent2D,
+    swap_chain_image_views: []c.VkImageView,
     window: ?*c.GLFWwindow,
     allocator: std.mem.Allocator,
 
@@ -37,6 +38,9 @@ pub const VulkanRenderer = struct {
     pub fn deinit(self: *VulkanRenderer) void {
         if (enable_validation_layers) {
             vk_dm.destroy_debug_util_messenger_ext(self.instance, self.debug_messenger, null);
+        }
+        for (self.swap_chain_image_views) |image_view| {
+            c.vkDestroyImageView(self.device, image_view, null);
         }
         defer c.vkDestroySwapchainKHR(self.device, self.swap_chain, null);
         defer c.vkDestroyDevice(self.device, null);
@@ -55,6 +59,7 @@ pub const VulkanRenderer = struct {
         try self.pick_physical_device();
         try self.create_logical_device();
         try self.create_swap_chain();
+        try self.create_image_views();
     }
 
     pub fn create_instance(self: *VulkanRenderer) !void {
@@ -261,11 +266,41 @@ pub const VulkanRenderer = struct {
         _ = c.vkGetSwapchainImagesKHR(self.device, self.swap_chain, &image_count, null);
 
         const swap_chain_images = try self.allocator.alloc(c.VkImage, image_count);
-        defer self.allocator.free(swap_chain_images);
+        // defer self.allocator.free(swap_chain_images);
+
         _ = c.vkGetSwapchainImagesKHR(self.device, self.swap_chain, &image_count, swap_chain_images.ptr);
 
         self.swap_chain_images = swap_chain_images;
         self.swap_chain_image_format = surface_format.format;
         self.swap_chain_extent = extent;
+    }
+
+    fn create_image_views(self: *VulkanRenderer) !void {
+        var swap_chain_image_views = try self.allocator.alloc(c.VkImageView, self.swap_chain_images.len);
+        // defer self.allocator.free(swap_chain_image_views);
+
+        for (0..self.swap_chain_images.len) |i| {
+            var create_info = c.VkImageViewCreateInfo{};
+            create_info.sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            create_info.image = self.swap_chain_images[i];
+            create_info.viewType = c.VK_IMAGE_VIEW_TYPE_2D;
+            create_info.format = self.swap_chain_image_format;
+            create_info.components.r = c.VK_COMPONENT_SWIZZLE_IDENTITY;
+            create_info.components.g = c.VK_COMPONENT_SWIZZLE_IDENTITY;
+            create_info.components.b = c.VK_COMPONENT_SWIZZLE_IDENTITY;
+            create_info.components.a = c.VK_COMPONENT_SWIZZLE_IDENTITY;
+            create_info.subresourceRange.aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT;
+            create_info.subresourceRange.baseMipLevel = 0;
+            create_info.subresourceRange.levelCount = 1;
+            create_info.subresourceRange.baseArrayLayer = 0;
+            create_info.subresourceRange.layerCount = 1;
+
+            if (c.vkCreateImageView(self.device, &create_info, null, &swap_chain_image_views[i]) != c.VK_SUCCESS) {
+                std.log.err("Vulkan: failed to create image views!", .{});
+                return error.Vulkan;
+            }
+        }
+
+        self.swap_chain_image_views = swap_chain_image_views;
     }
 };
