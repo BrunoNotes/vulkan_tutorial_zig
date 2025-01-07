@@ -7,6 +7,8 @@ const vk_ins = @import("instance.zig");
 const vk_phd = @import("physical_device.zig");
 const vk_ld = @import("logical_device.zig");
 const vk_sc = @import("swap_chain.zig");
+const vk_sd = @import("shader.zig");
+const util = @import("../util/file.zig");
 
 pub const validation_layers = [_][*c]const u8{"VK_LAYER_KHRONOS_validation"};
 pub const enable_validation_layers = builtin.mode == .Debug;
@@ -60,6 +62,7 @@ pub const VulkanRenderer = struct {
         try self.create_logical_device();
         try self.create_swap_chain();
         try self.create_image_views();
+        try self.create_graphics_pipeline();
     }
 
     pub fn create_instance(self: *VulkanRenderer) !void {
@@ -302,5 +305,32 @@ pub const VulkanRenderer = struct {
         }
 
         self.swap_chain_image_views = swap_chain_image_views;
+    }
+
+    fn create_graphics_pipeline(self: *VulkanRenderer) !void {
+        const vert_shader_code = try util.read_file(self.allocator, "shaders/compiled/triangle.vert.spv");
+        const frag_shader_code = try util.read_file(self.allocator, "shaders/compiled/triangle.frag.spv");
+
+        const vert_shader_module = try vk_sd.create_shader_module(self.device, vert_shader_code);
+        const frag_shader_module = try vk_sd.create_shader_module(self.device, frag_shader_code);
+        defer {
+            c.vkDestroyShaderModule(self.device, vert_shader_module, null);
+            c.vkDestroyShaderModule(self.device, frag_shader_module, null);
+        }
+
+        var vert_shader_stage_info = c.VkPipelineShaderStageCreateInfo{};
+        vert_shader_stage_info.sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        vert_shader_stage_info.stage = c.VK_SHADER_STAGE_VERTEX_BIT;
+        vert_shader_stage_info.module = vert_shader_module;
+        vert_shader_stage_info.pName = "main";
+
+        var frag_shader_stage_info = c.VkPipelineShaderStageCreateInfo{};
+        frag_shader_stage_info.sType = c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        frag_shader_stage_info.stage = c.VK_SHADER_STAGE_FRAGMENT_BIT;
+        frag_shader_stage_info.module = frag_shader_module;
+        frag_shader_stage_info.pName = "main";
+
+        const shader_stages = [_]c.VkPipelineShaderStageCreateInfo{ vert_shader_stage_info, frag_shader_stage_info };
+        _ = shader_stages;
     }
 };
