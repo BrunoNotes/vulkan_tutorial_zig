@@ -96,7 +96,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    exe.linkLibC();
+    exe.linkLibCpp();
 
     // GLFW
     if (!file_exists("third_party/glfw/build/src/libglfw3.a")) {

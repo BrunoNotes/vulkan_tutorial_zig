@@ -8,6 +8,7 @@ const vk_phd = @import("physical_device.zig");
 const vk_ld = @import("logical_device.zig");
 const vk_sc = @import("swap_chain.zig");
 const vk_sd = @import("shader.zig");
+const vk_cb = @import("command_buffer.zig");
 const util = @import("../util/file.zig");
 
 pub const validation_layers = [_][*c]const u8{"VK_LAYER_KHRONOS_validation"};
@@ -27,8 +28,18 @@ pub const VulkanRenderer = struct {
     swap_chain_image_format: c.VkFormat,
     swap_chain_extent: c.VkExtent2D,
     swap_chain_image_views: []c.VkImageView,
+    render_pass: c.VkRenderPass,
+    pipeline_layout: c.VkPipelineLayout,
+    graphics_pipeline: c.VkPipeline,
+    swap_chain_framebuffers: []c.VkFramebuffer,
+    command_pool: c.VkCommandPool,
+    command_buffer: c.VkCommandBuffer,
     window: ?*c.GLFWwindow,
     allocator: std.mem.Allocator,
+
+    image_available_semaphore: c.VkSemaphore,
+    render_finished_semaphore: c.VkSemaphore,
+    in_flight_fence: c.VkFence,
 
     pub fn init(allocator: std.mem.Allocator) !VulkanRenderer {
         return std.mem.zeroInit(VulkanRenderer, .{
@@ -38,16 +49,34 @@ pub const VulkanRenderer = struct {
 
     // cleanup
     pub fn deinit(self: *VulkanRenderer) void {
-        if (enable_validation_layers) {
-            vk_dm.destroy_debug_util_messenger_ext(self.instance, self.debug_messenger, null);
+        defer {
+            if (enable_validation_layers) {
+                vk_dm.destroy_debug_util_messenger_ext(self.instance, self.debug_messenger, null);
+            }
+
+            c.vkDestroySemaphore(self.device, self.image_available_semaphore, null);
+            c.vkDestroySemaphore(self.device, self.render_finished_semaphore, null);
+            c.vkDestroyFence(self.device, self.in_flight_fence, null);
+
+            c.vkDestroyCommandPool(self.device, self.command_pool, null);
+
+            for (self.swap_chain_framebuffers) |framebuffer| {
+                c.vkDestroyFramebuffer(self.device, framebuffer, null);
+            }
+
+            for (self.swap_chain_image_views) |image_view| {
+                // self.allocator.free(self.swap_chain_framebuffers);
+                c.vkDestroyImageView(self.device, image_view, null);
+            }
+
+            c.vkDestroyPipeline(self.device, self.graphics_pipeline, null);
+            c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
+            c.vkDestroyRenderPass(self.device, self.render_pass, null);
+            c.vkDestroySwapchainKHR(self.device, self.swap_chain, null);
+            c.vkDestroyDevice(self.device, null);
+            c.vkDestroySurfaceKHR(self.instance, self.surface, null);
+            c.vkDestroyInstance(self.instance, null);
         }
-        for (self.swap_chain_image_views) |image_view| {
-            c.vkDestroyImageView(self.device, image_view, null);
-        }
-        defer c.vkDestroySwapchainKHR(self.device, self.swap_chain, null);
-        defer c.vkDestroyDevice(self.device, null);
-        defer c.vkDestroySurfaceKHR(self.instance, self.surface, null);
-        defer c.vkDestroyInstance(self.instance, null);
     }
 
     // init_vulkan
@@ -62,7 +91,12 @@ pub const VulkanRenderer = struct {
         try self.create_logical_device();
         try self.create_swap_chain();
         try self.create_image_views();
+        try self.create_render_pass();
         try self.create_graphics_pipeline();
+        try self.create_framebuffers();
+        try self.create_command_pool();
+        try self.create_command_buffer();
+        try self.create_sync_objects();
     }
 
     pub fn create_instance(self: *VulkanRenderer) !void {
@@ -266,12 +300,18 @@ pub const VulkanRenderer = struct {
             return error.Vulkan;
         }
 
-        _ = c.vkGetSwapchainImagesKHR(self.device, self.swap_chain, &image_count, null);
+        if (c.vkGetSwapchainImagesKHR(self.device, self.swap_chain, &image_count, null) != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to get swap chain images!", .{});
+            return error.Vulkan;
+        }
 
         const swap_chain_images = try self.allocator.alloc(c.VkImage, image_count);
         // defer self.allocator.free(swap_chain_images);
 
-        _ = c.vkGetSwapchainImagesKHR(self.device, self.swap_chain, &image_count, swap_chain_images.ptr);
+        if (c.vkGetSwapchainImagesKHR(self.device, self.swap_chain, &image_count, swap_chain_images.ptr) != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to get swap chain images!", .{});
+            return error.Vulkan;
+        }
 
         self.swap_chain_images = swap_chain_images;
         self.swap_chain_image_format = surface_format.format;
@@ -279,7 +319,7 @@ pub const VulkanRenderer = struct {
     }
 
     fn create_image_views(self: *VulkanRenderer) !void {
-        var swap_chain_image_views = try self.allocator.alloc(c.VkImageView, self.swap_chain_images.len);
+        self.swap_chain_image_views = try self.allocator.alloc(c.VkImageView, self.swap_chain_images.len);
         // defer self.allocator.free(swap_chain_image_views);
 
         for (0..self.swap_chain_images.len) |i| {
@@ -298,13 +338,55 @@ pub const VulkanRenderer = struct {
             create_info.subresourceRange.baseArrayLayer = 0;
             create_info.subresourceRange.layerCount = 1;
 
-            if (c.vkCreateImageView(self.device, &create_info, null, &swap_chain_image_views[i]) != c.VK_SUCCESS) {
+            if (c.vkCreateImageView(self.device, &create_info, null, &self.swap_chain_image_views[i]) != c.VK_SUCCESS) {
                 std.log.err("Vulkan: failed to create image views!", .{});
                 return error.Vulkan;
             }
         }
+    }
 
-        self.swap_chain_image_views = swap_chain_image_views;
+    fn create_render_pass(self: *VulkanRenderer) !void {
+        var color_attachment = c.VkAttachmentDescription{};
+        color_attachment.format = self.swap_chain_image_format;
+        color_attachment.samples = c.VK_SAMPLE_COUNT_1_BIT;
+        color_attachment.loadOp = c.VK_ATTACHMENT_LOAD_OP_CLEAR;
+        color_attachment.storeOp = c.VK_ATTACHMENT_STORE_OP_STORE;
+        color_attachment.stencilLoadOp = c.VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        color_attachment.stencilStoreOp = c.VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        color_attachment.initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED;
+        color_attachment.finalLayout = c.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+        var color_attachment_ref = c.VkAttachmentReference{};
+        color_attachment_ref.attachment = 0;
+        color_attachment_ref.layout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        var subpass = c.VkSubpassDescription{};
+        subpass.pipelineBindPoint = c.VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &color_attachment_ref;
+
+        var render_pass_info = c.VkRenderPassCreateInfo{};
+        render_pass_info.sType = c.VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        render_pass_info.attachmentCount = 1;
+        render_pass_info.pAttachments = &color_attachment;
+        render_pass_info.subpassCount = 1;
+        render_pass_info.pSubpasses = &subpass;
+
+        var dependency = c.VkSubpassDependency{};
+        dependency.srcSubpass = c.VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+        dependency.srcStageMask = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.srcAccessMask = 0;
+        dependency.dstStageMask = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.dstAccessMask = c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+        render_pass_info.dependencyCount = 1;
+        render_pass_info.pDependencies = &dependency;
+
+        if (c.vkCreateRenderPass(self.device, &render_pass_info, null, &self.render_pass) != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to create render pass!", .{});
+            return error.Vulkan;
+        }
     }
 
     fn create_graphics_pipeline(self: *VulkanRenderer) !void {
@@ -330,7 +412,261 @@ pub const VulkanRenderer = struct {
         frag_shader_stage_info.module = frag_shader_module;
         frag_shader_stage_info.pName = "main";
 
-        const shader_stages = [_]c.VkPipelineShaderStageCreateInfo{ vert_shader_stage_info, frag_shader_stage_info };
-        _ = shader_stages;
+        // const shader_stages = [_]c.VkPipelineShaderStageCreateInfo{ vert_shader_stage_info, frag_shader_stage_info };
+        var shader_stages = std.ArrayList(c.VkPipelineShaderStageCreateInfo).init(self.allocator);
+        defer shader_stages.deinit();
+        try shader_stages.append(vert_shader_stage_info);
+        try shader_stages.append(frag_shader_stage_info);
+
+        var dynamic_states = std.ArrayList(c.VkDynamicState).init(self.allocator);
+        defer dynamic_states.deinit();
+        try dynamic_states.append(c.VK_DYNAMIC_STATE_VIEWPORT);
+        try dynamic_states.append(c.VK_DYNAMIC_STATE_SCISSOR);
+
+        var dynamic_state = c.VkPipelineDynamicStateCreateInfo{};
+        dynamic_state.sType = c.VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamic_state.dynamicStateCount = @intCast(dynamic_states.items.len);
+        dynamic_state.pDynamicStates = @ptrCast(dynamic_states.items.ptr);
+
+        var vertex_input_info = c.VkPipelineVertexInputStateCreateInfo{};
+        vertex_input_info.sType = c.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertex_input_info.vertexBindingDescriptionCount = 0;
+        vertex_input_info.pVertexBindingDescriptions = null; // optional
+        vertex_input_info.vertexAttributeDescriptionCount = 0;
+        vertex_input_info.pVertexAttributeDescriptions = null; // optional
+
+        var input_assembly = c.VkPipelineInputAssemblyStateCreateInfo{};
+        input_assembly.sType = c.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        input_assembly.topology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        input_assembly.primitiveRestartEnable = c.VK_FALSE;
+
+        var viewport_state = c.VkPipelineViewportStateCreateInfo{};
+        viewport_state.sType = c.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewport_state.viewportCount = 1;
+        viewport_state.scissorCount = 1;
+
+        var rasterizer = c.VkPipelineRasterizationStateCreateInfo{};
+        rasterizer.sType = c.VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.depthClampEnable = c.VK_FALSE;
+        rasterizer.rasterizerDiscardEnable = c.VK_FALSE;
+        rasterizer.polygonMode = c.VK_POLYGON_MODE_FILL;
+        rasterizer.lineWidth = 1.0;
+        rasterizer.cullMode = c.VK_CULL_MODE_BACK_BIT;
+        rasterizer.frontFace = c.VK_FRONT_FACE_CLOCKWISE;
+        rasterizer.depthBiasEnable = c.VK_FALSE;
+        rasterizer.depthBiasEnable = c.VK_FALSE;
+        rasterizer.depthBiasConstantFactor = 0.0; // Optional
+        rasterizer.depthBiasClamp = 0.0; // Optional
+        rasterizer.depthBiasSlopeFactor = 0.0; // Optional
+
+        var multisampling = c.VkPipelineMultisampleStateCreateInfo{};
+        multisampling.sType = c.VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampling.sampleShadingEnable = c.VK_FALSE;
+        multisampling.rasterizationSamples = c.VK_SAMPLE_COUNT_1_BIT;
+        multisampling.minSampleShading = 1.0; // Optional
+        multisampling.pSampleMask = null; // Optional
+        multisampling.alphaToCoverageEnable = c.VK_FALSE; // Optional
+        multisampling.alphaToOneEnable = c.VK_FALSE; // Optional
+
+        var color_blend_attachment = c.VkPipelineColorBlendAttachmentState{};
+        color_blend_attachment.colorWriteMask = c.VK_COLOR_COMPONENT_R_BIT | c.VK_COLOR_COMPONENT_G_BIT | c.VK_COLOR_COMPONENT_B_BIT | c.VK_COLOR_COMPONENT_A_BIT;
+        // color_blend_attachment.blendEnable = c.VK_FALSE;
+        // color_blend_attachment.srcColorBlendFactor = c.VK_BLEND_FACTOR_ONE; // Optional
+        // color_blend_attachment.dstColorBlendFactor = c.VK_BLEND_FACTOR_ZERO; // Optional
+        // color_blend_attachment.colorBlendOp = c.VK_BLEND_OP_ADD; // Optional
+        // color_blend_attachment.srcAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE; // Optional
+        // color_blend_attachment.dstAlphaBlendFactor = c.VK_BLEND_FACTOR_ZERO; // Optional
+        // color_blend_attachment.alphaBlendOp = c.VK_BLEND_OP_ADD; // Optional
+        color_blend_attachment.blendEnable = c.VK_TRUE;
+        color_blend_attachment.srcColorBlendFactor = c.VK_BLEND_FACTOR_SRC_ALPHA;
+        color_blend_attachment.dstColorBlendFactor = c.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        color_blend_attachment.colorBlendOp = c.VK_BLEND_OP_ADD;
+        color_blend_attachment.srcAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE;
+        color_blend_attachment.dstAlphaBlendFactor = c.VK_BLEND_FACTOR_ZERO;
+        color_blend_attachment.alphaBlendOp = c.VK_BLEND_OP_ADD;
+
+        var color_blending = c.VkPipelineColorBlendStateCreateInfo{};
+        color_blending.sType = c.VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        // color_blending.logicOpEnable = c.VK_FALSE;
+        color_blending.logicOpEnable = c.VK_TRUE;
+        color_blending.logicOp = c.VK_LOGIC_OP_COPY; // Optional
+        color_blending.attachmentCount = 1;
+        color_blending.pAttachments = &color_blend_attachment;
+        color_blending.blendConstants[0] = 0.0; // Optional
+        color_blending.blendConstants[1] = 0.0; // Optional
+        color_blending.blendConstants[2] = 0.0; // Optional
+        color_blending.blendConstants[3] = 0.0; // Optional
+
+        var pipeline_layout_info = c.VkPipelineLayoutCreateInfo{};
+        pipeline_layout_info.sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipeline_layout_info.setLayoutCount = 0; // Optional
+        pipeline_layout_info.pSetLayouts = null; // Optional
+        pipeline_layout_info.pushConstantRangeCount = 0; // Optional
+        pipeline_layout_info.pPushConstantRanges = null; // Optional
+
+        if (c.vkCreatePipelineLayout(self.device, &pipeline_layout_info, null, &self.pipeline_layout) != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to create pipeline layout!", .{});
+            return error.Vulkan;
+        }
+
+        var pipeline_info = c.VkGraphicsPipelineCreateInfo{};
+        pipeline_info.sType = c.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipeline_info.stageCount = 2;
+        pipeline_info.pStages = shader_stages.items.ptr;
+        pipeline_info.pVertexInputState = &vertex_input_info;
+        pipeline_info.pInputAssemblyState = &input_assembly;
+        pipeline_info.pViewportState = &viewport_state;
+        pipeline_info.pRasterizationState = &rasterizer;
+        pipeline_info.pMultisampleState = &multisampling;
+        pipeline_info.pDepthStencilState = null; // Optional
+        pipeline_info.pColorBlendState = &color_blending;
+        pipeline_info.pDynamicState = &dynamic_state;
+        pipeline_info.layout = self.pipeline_layout;
+        pipeline_info.renderPass = self.render_pass;
+        pipeline_info.subpass = 0;
+        pipeline_info.basePipelineHandle = null; // Optional
+        pipeline_info.basePipelineIndex = -1; // Optional
+
+        if (c.vkCreateGraphicsPipelines(self.device, null, 1, &pipeline_info, null, &self.graphics_pipeline) != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to create graphics pipeline!", .{});
+            return error.Vulkan;
+        }
+    }
+
+    fn create_framebuffers(self: *VulkanRenderer) !void {
+        self.swap_chain_framebuffers = try self.allocator.alloc(c.VkFramebuffer, self.swap_chain_image_views.len);
+
+        for (0..self.swap_chain_image_views.len) |i| {
+            var attachments = std.ArrayList(c.VkImageView).init(self.allocator);
+            defer attachments.deinit();
+            try attachments.append(self.swap_chain_image_views[i]);
+
+            var framebuffer_info = c.VkFramebufferCreateInfo{};
+            framebuffer_info.sType = c.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            framebuffer_info.renderPass = self.render_pass;
+            framebuffer_info.attachmentCount = 1;
+            framebuffer_info.pAttachments = attachments.items.ptr;
+            framebuffer_info.width = self.swap_chain_extent.width;
+            framebuffer_info.height = self.swap_chain_extent.height;
+            framebuffer_info.layers = 1;
+
+            if (c.vkCreateFramebuffer(self.device, &framebuffer_info, null, &self.swap_chain_framebuffers[i]) != c.VK_SUCCESS) {
+                std.log.err("Vulkan: failed to create framebuffer!", .{});
+                return error.Vulkan;
+            }
+        }
+    }
+
+    fn create_command_pool(self: *VulkanRenderer) !void {
+        const queue_family_indices = try vk_ld.find_queue_families(self.allocator, self.physical_device, self.surface);
+
+        var pool_info = c.VkCommandPoolCreateInfo{};
+        pool_info.sType = c.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        pool_info.flags = c.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        if (queue_family_indices.graphics_family) |graphics_family| {
+            pool_info.queueFamilyIndex = graphics_family;
+        }
+
+        if (c.vkCreateCommandPool(self.device, &pool_info, null, &self.command_pool) != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to create command pool!", .{});
+            return error.Vulkan;
+        }
+    }
+
+    fn create_command_buffer(self: *VulkanRenderer) !void {
+        var alloc_info = c.VkCommandBufferAllocateInfo{};
+        alloc_info.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        alloc_info.commandPool = self.command_pool;
+        alloc_info.level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        alloc_info.commandBufferCount = 1;
+
+        if (c.vkAllocateCommandBuffers(self.device, &alloc_info, &self.command_buffer) != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to allocate command buffers!", .{});
+            return error.Vulkan;
+        }
+    }
+
+    fn create_sync_objects(self: *VulkanRenderer) !void {
+        var semaphore_info = c.VkSemaphoreCreateInfo{};
+        semaphore_info.sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+        var fence_info = c.VkFenceCreateInfo{};
+        fence_info.sType = c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        fence_info.flags = c.VK_FENCE_CREATE_SIGNALED_BIT;
+
+        if (c.vkCreateSemaphore(self.device, &semaphore_info, null, &self.image_available_semaphore) != c.VK_SUCCESS or
+            c.vkCreateSemaphore(self.device, &semaphore_info, null, &self.render_finished_semaphore) != c.VK_SUCCESS or
+            c.vkCreateFence(self.device, &fence_info, null, &self.in_flight_fence) != c.VK_SUCCESS)
+        {
+            std.log.err("Vulkan: failed to create semaphores!", .{});
+            return error.Vulkan;
+        }
+    }
+
+    pub fn draw_frame(self: *VulkanRenderer) !void {
+        if (c.vkWaitForFences(self.device, 1, &self.in_flight_fence, c.VK_TRUE, std.math.maxInt(u64)) != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to wait for fence!", .{});
+            return error.Vulkan;
+        }
+
+        if (c.vkResetFences(self.device, 1, &self.in_flight_fence) != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to reset for fences!", .{});
+            return error.Vulkan;
+        }
+
+        var image_index: u32 = 0;
+
+        _ = c.vkAcquireNextImageKHR(self.device, self.swap_chain, std.math.maxInt(u64), self.image_available_semaphore, @ptrCast(c.VK_NULL_HANDLE), &image_index);
+
+        _ = c.vkResetCommandBuffer(self.command_buffer, 0);
+
+        try vk_cb.record_command_buffer(
+            self.command_buffer,
+            image_index,
+            self.render_pass,
+            self.swap_chain_framebuffers,
+            self.swap_chain_extent,
+            self.graphics_pipeline,
+        );
+
+        var submit_info = c.VkSubmitInfo{};
+        submit_info.sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+        var wait_semaphores = [1]c.VkSemaphore{self.image_available_semaphore};
+        var wait_stages = [1]c.VkPipelineStageFlags{c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+        submit_info.waitSemaphoreCount = 1;
+        submit_info.pWaitSemaphores = &wait_semaphores;
+        submit_info.pWaitDstStageMask = &wait_stages;
+        submit_info.commandBufferCount = 1;
+        submit_info.pCommandBuffers = &self.command_buffer;
+
+        // const signal_semaphore = [1]c.VkSemaphore{self.render_finished_semaphore};
+        var signal_semaphore = std.ArrayList(c.VkSemaphore).init(self.allocator);
+        defer signal_semaphore.deinit();
+        try signal_semaphore.append(self.render_finished_semaphore);
+        submit_info.signalSemaphoreCount = 1;
+        submit_info.pSignalSemaphores = signal_semaphore.items.ptr;
+
+        if (c.vkQueueSubmit(self.graphics_queue, 1, &submit_info, self.in_flight_fence) != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to submit draw command buffer!", .{});
+            return error.Vulkan;
+        }
+
+        var present_info = c.VkPresentInfoKHR{};
+        present_info.sType = c.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        present_info.waitSemaphoreCount = 1;
+        present_info.pWaitSemaphores = signal_semaphore.items.ptr;
+
+        // var swap_chains = [1]c.VkSwapchainKHR{self.swap_chain};
+        var swap_chains = std.ArrayList(c.VkSwapchainKHR).init(self.allocator);
+        defer swap_chains.deinit();
+        try swap_chains.append(self.swap_chain);
+
+        present_info.swapchainCount = 1;
+        present_info.pSwapchains = swap_chains.items.ptr;
+        present_info.pImageIndices = &image_index;
+        present_info.pResults = null; // Optional
+
+        _ = c.vkQueuePresentKHR(self.present_queue, &present_info);
     }
 };

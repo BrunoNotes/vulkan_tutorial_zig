@@ -28,9 +28,11 @@ const Application = struct {
 
     // cleanup
     pub fn deinit(self: *Application) void {
-        defer self.vk_renderer.deinit();
-        defer c.glfwDestroyWindow(self.window);
-        defer c.glfwTerminate();
+        defer {
+            self.vk_renderer.deinit();
+            c.glfwDestroyWindow(self.window);
+            c.glfwTerminate();
+        }
     }
 
     pub fn run(self: *Application) !void {
@@ -47,6 +49,7 @@ const Application = struct {
             return error.GLFWInitError;
         }
 
+        c.glfwWindowHint(c.GLFW_PLATFORM_X11, c.GLFW_TRUE); // dont initialize opengl
         c.glfwWindowHint(c.GLFW_CLIENT_API, c.GLFW_NO_API); // dont initialize opengl
         c.glfwWindowHint(c.GLFW_RESIZABLE, c.GLFW_FALSE); // disable resize
 
@@ -64,7 +67,11 @@ const Application = struct {
         std.log.info("Main loop", .{});
         while (c.glfwWindowShouldClose(self.window) == c.GLFW_FALSE) {
             c.glfwPollEvents();
+
+            try self.vk_renderer.draw_frame();
         }
+
+        _ = c.vkDeviceWaitIdle(self.vk_renderer.device);
     }
 };
 
