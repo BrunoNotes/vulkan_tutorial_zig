@@ -49,7 +49,6 @@ const Application = struct {
             return error.GLFWInitError;
         }
 
-        c.glfwWindowHint(c.GLFW_PLATFORM_X11, c.GLFW_TRUE); // dont initialize opengl
         c.glfwWindowHint(c.GLFW_CLIENT_API, c.GLFW_NO_API); // dont initialize opengl
         c.glfwWindowHint(c.GLFW_RESIZABLE, c.GLFW_FALSE); // disable resize
 
