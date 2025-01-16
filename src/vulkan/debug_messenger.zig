@@ -20,7 +20,6 @@ pub fn debug_callback(
     _ = message_type;
     _ = p_user_data;
     if (message_severity >= c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
-        // std.debug.print("{any}\n", .{p_callback_data});
         const msg = (p_callback_data orelse return c.VK_TRUE).pMessage orelse return c.VK_TRUE;
         std.log.warn("Vulkan, validation layer: {s} ", .{msg});
     }

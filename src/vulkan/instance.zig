@@ -12,6 +12,7 @@ pub fn check_validation_layer_support(allocator: std.mem.Allocator) !bool {
 
     const available_layers = try allocator.alloc(c.VkLayerProperties, layer_count);
     defer allocator.free(available_layers);
+
     _ = c.vkEnumerateInstanceLayerProperties(&layer_count, available_layers.ptr);
 
     for (validation_layers) |layer_name| {

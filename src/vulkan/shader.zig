@@ -8,6 +8,7 @@ pub fn create_shader_module(device: c.VkDevice, code: []u8) !c.VkShaderModule {
     create_info.pCode = @alignCast(@ptrCast(code.ptr));
 
     var shader_module: c.VkShaderModule = undefined;
+
     if (c.vkCreateShaderModule(device, &create_info, null, &shader_module) != c.VK_SUCCESS) {
         std.log.err("Vulkan: failed to create shader module!", .{});
         return error.Vulkan;

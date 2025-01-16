@@ -1,6 +1,8 @@
 const std = @import("std");
 const c = @import("../c.zig").c;
 
+const vk_vt = @import("vertex.zig");
+
 pub fn record_command_buffer(
     command_buffer: c.VkCommandBuffer,
     image_index: u32,
@@ -8,6 +10,8 @@ pub fn record_command_buffer(
     swap_chain_framebuffers: []c.VkFramebuffer,
     swap_chain_extent: c.VkExtent2D,
     graphics_pipeline: c.VkPipeline,
+    vertex_buffer: c.VkBuffer,
+    vertices: []vk_vt.Vertex,
 ) !void {
     var begin_info = c.VkCommandBufferBeginInfo{};
     begin_info.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -54,7 +58,12 @@ pub fn record_command_buffer(
 
     c.vkCmdSetScissor(command_buffer, 0, 1, &scissor);
 
-    c.vkCmdDraw(command_buffer, 3, 1, 0, 0);
+    var vertex_buffers = [1]c.VkBuffer{vertex_buffer};
+    var offsets = [1]c.VkDeviceSize{0};
+
+    c.vkCmdBindVertexBuffers(command_buffer, 0, 1, &vertex_buffers, &offsets);
+
+    c.vkCmdDraw(command_buffer, @intCast(vertices.len), 1, 0, 0);
 
     c.vkCmdEndRenderPass(command_buffer);
 

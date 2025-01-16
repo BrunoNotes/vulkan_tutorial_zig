@@ -50,16 +50,26 @@ const Application = struct {
         }
 
         c.glfwWindowHint(c.GLFW_CLIENT_API, c.GLFW_NO_API); // dont initialize opengl
-        c.glfwWindowHint(c.GLFW_RESIZABLE, c.GLFW_FALSE); // disable resize
+        // c.glfwWindowHint(c.GLFW_RESIZABLE, c.GLFW_TRUE); // disable resize
 
         _ = c.glfwSetErrorCallback(GLFW_error_callback);
 
-        const window = c.glfwCreateWindow(self.window_width, self.window_height, self.window_name, null, null) orelse {
+        self.window = c.glfwCreateWindow(self.window_width, self.window_height, self.window_name, null, null) orelse {
             std.log.err("GLFW: Error creatind window!", .{});
             return error.GLFWInitError;
         };
+        c.glfwSetWindowUserPointer(self.window, self);
+        _ = c.glfwSetFramebufferSizeCallback(self.window, framebuffer_resize_callback);
+    }
 
-        self.window = window;
+    fn framebuffer_resize_callback(window: ?*c.GLFWwindow, width: i32, height: i32) callconv(.C) void {
+        _ = width;
+        _ = height;
+
+        if (c.glfwGetWindowUserPointer(window)) |self_ptr| {
+            var self = @as(*Application, @ptrCast(@alignCast(self_ptr)));
+            self.vk_renderer.framebuffer_resized = true;
+        }
     }
 
     fn main_loop(self: *Application) !void {
@@ -68,6 +78,9 @@ const Application = struct {
             c.glfwPollEvents();
 
             try self.vk_renderer.draw_frame();
+            if (self.vk_renderer.framebuffer_resized) {
+                std.debug.print("resized: {}\n", .{self.vk_renderer.framebuffer_resized});
+            }
         }
 
         _ = c.vkDeviceWaitIdle(self.vk_renderer.device);

@@ -12,6 +12,7 @@ pub fn find_queue_families(allocator: std.mem.Allocator, physical_device: c.VkPh
 
     const queue_families = try allocator.alloc(c.VkQueueFamilyProperties, queue_family_count);
     defer allocator.free(queue_families);
+
     _ = c.vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, queue_families.ptr);
 
     for (queue_families, 0..queue_families.len) |queue_family, i| {

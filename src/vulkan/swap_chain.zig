@@ -69,6 +69,7 @@ pub fn choose_swap_extent(capabilities: c.VkSurfaceCapabilitiesKHR, window: ?*c.
     } else {
         var width: i32 = 0;
         var height: i32 = 0;
+
         c.glfwGetFramebufferSize(window, &width, &height);
 
         var actual_extent = c.VkExtent2D{

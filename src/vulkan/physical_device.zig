@@ -59,6 +59,7 @@ pub fn find_queue_families(allocator: std.mem.Allocator, device: c.VkPhysicalDev
 
     const queue_families = try allocator.alloc(c.VkQueueFamilyProperties, queue_family_count);
     defer allocator.free(queue_families);
+
     _ = c.vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count, queue_families.ptr);
 
     for (queue_families, 0..queue_families.len) |queue_family, i| {
@@ -85,6 +86,7 @@ fn check_device_extension_support(allocator: std.mem.Allocator, device: c.VkPhys
 
     const available_extensions = try allocator.alloc(c.VkExtensionProperties, extension_count);
     defer allocator.free(available_extensions);
+
     _ = c.vkEnumerateDeviceExtensionProperties(device, null, &extension_count, available_extensions.ptr);
 
     var required_extensions = std.StringHashMap(void).init(allocator);

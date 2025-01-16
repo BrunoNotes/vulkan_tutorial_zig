@@ -9,11 +9,14 @@ const vk_ld = @import("logical_device.zig");
 const vk_sc = @import("swap_chain.zig");
 const vk_sd = @import("shader.zig");
 const vk_cb = @import("command_buffer.zig");
+const vk_vt = @import("vertex.zig");
 const util = @import("../util/file.zig");
 
 pub const validation_layers = [_][*c]const u8{"VK_LAYER_KHRONOS_validation"};
 pub const enable_validation_layers = builtin.mode == .Debug;
 pub const device_extensions = [_][*c]const u8{c.VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+
+const MAX_FRAME_IN_FLIGHT = 2;
 
 pub const VulkanRenderer = struct {
     instance: c.VkInstance,
@@ -33,50 +36,62 @@ pub const VulkanRenderer = struct {
     graphics_pipeline: c.VkPipeline,
     swap_chain_framebuffers: []c.VkFramebuffer,
     command_pool: c.VkCommandPool,
-    command_buffer: c.VkCommandBuffer,
+    command_buffers: []c.VkCommandBuffer,
     window: ?*c.GLFWwindow,
     allocator: std.mem.Allocator,
 
-    image_available_semaphore: c.VkSemaphore,
-    render_finished_semaphore: c.VkSemaphore,
-    in_flight_fence: c.VkFence,
+    image_available_semaphores: []c.VkSemaphore,
+    render_finished_semaphores: []c.VkSemaphore,
+    in_flight_fences: []c.VkFence,
+
+    framebuffer_resized: bool,
+    current_frame: u32,
+
+    vertex_buffer: c.VkBuffer,
+    vertex_buffer_memory: c.VkDeviceMemory,
+
+    var vertices = [3]vk_vt.Vertex{
+        .{ .pos = .{ 0.0, -0.5 }, .color = .{ 1, 0, 0 } },
+        .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0, 1, 0 } },
+        .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0, 0, 1 } },
+    };
 
     pub fn init(allocator: std.mem.Allocator) !VulkanRenderer {
         return std.mem.zeroInit(VulkanRenderer, .{
             .allocator = allocator,
+            .current_frame = 0,
+            .framebuffer_resized = false,
         });
     }
 
     // cleanup
     pub fn deinit(self: *VulkanRenderer) void {
-        defer {
-            if (enable_validation_layers) {
-                vk_dm.destroy_debug_util_messenger_ext(self.instance, self.debug_messenger, null);
-            }
+        self.cleanup_swap_chain() catch @panic("Vulkan: error cleaning swap chain!");
 
-            c.vkDestroySemaphore(self.device, self.image_available_semaphore, null);
-            c.vkDestroySemaphore(self.device, self.render_finished_semaphore, null);
-            c.vkDestroyFence(self.device, self.in_flight_fence, null);
+        c.vkDestroyBuffer(self.device, self.vertex_buffer, null);
+        c.vkFreeMemory(self.device, self.vertex_buffer_memory, null);
 
-            c.vkDestroyCommandPool(self.device, self.command_pool, null);
+        c.vkDestroyPipeline(self.device, self.graphics_pipeline, null);
+        c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
 
-            for (self.swap_chain_framebuffers) |framebuffer| {
-                c.vkDestroyFramebuffer(self.device, framebuffer, null);
-            }
+        c.vkDestroyRenderPass(self.device, self.render_pass, null);
 
-            for (self.swap_chain_image_views) |image_view| {
-                // self.allocator.free(self.swap_chain_framebuffers);
-                c.vkDestroyImageView(self.device, image_view, null);
-            }
-
-            c.vkDestroyPipeline(self.device, self.graphics_pipeline, null);
-            c.vkDestroyPipelineLayout(self.device, self.pipeline_layout, null);
-            c.vkDestroyRenderPass(self.device, self.render_pass, null);
-            c.vkDestroySwapchainKHR(self.device, self.swap_chain, null);
-            c.vkDestroyDevice(self.device, null);
-            c.vkDestroySurfaceKHR(self.instance, self.surface, null);
-            c.vkDestroyInstance(self.instance, null);
+        for (0..MAX_FRAME_IN_FLIGHT) |i| {
+            c.vkDestroySemaphore(self.device, self.image_available_semaphores[i], null);
+            c.vkDestroySemaphore(self.device, self.render_finished_semaphores[i], null);
+            c.vkDestroyFence(self.device, self.in_flight_fences[i], null);
         }
+
+        c.vkDestroyCommandPool(self.device, self.command_pool, null);
+
+        c.vkDestroyDevice(self.device, null);
+
+        if (enable_validation_layers) {
+            vk_dm.destroy_debug_util_messenger_ext(self.instance, self.debug_messenger, null);
+        }
+
+        c.vkDestroySurfaceKHR(self.instance, self.surface, null);
+        c.vkDestroyInstance(self.instance, null);
     }
 
     // init_vulkan
@@ -95,8 +110,43 @@ pub const VulkanRenderer = struct {
         try self.create_graphics_pipeline();
         try self.create_framebuffers();
         try self.create_command_pool();
-        try self.create_command_buffer();
+        try self.create_vextex_buffer();
+        try self.create_command_buffers();
         try self.create_sync_objects();
+    }
+
+    fn cleanup_swap_chain(self: *VulkanRenderer) !void {
+        for (self.swap_chain_framebuffers) |framebuffer| {
+            c.vkDestroyFramebuffer(self.device, framebuffer, null);
+        }
+
+        for (self.swap_chain_image_views) |image_view| {
+            // self.allocator.free(self.swap_chain_framebuffers);
+            c.vkDestroyImageView(self.device, image_view, null);
+        }
+
+        c.vkDestroySwapchainKHR(self.device, self.swap_chain, null);
+    }
+
+    pub fn recreate_swap_chain(self: *VulkanRenderer) !void {
+        var width: i32 = 0;
+        var height: i32 = 0;
+
+        c.glfwGetFramebufferSize(self.window, &width, &height);
+
+        while (width == 0 or height == 0) {
+            std.debug.print("paused\n", .{});
+            c.glfwGetFramebufferSize(self.window, &width, &height);
+            c.glfwWaitEvents();
+        }
+
+        _ = c.vkDeviceWaitIdle(self.device);
+
+        try self.cleanup_swap_chain();
+
+        try self.create_swap_chain();
+        try self.create_image_views();
+        try self.create_framebuffers();
     }
 
     pub fn create_instance(self: *VulkanRenderer) !void {
@@ -126,10 +176,9 @@ pub const VulkanRenderer = struct {
         };
 
         var debug_create_info = std.mem.zeroInit(c.VkDebugUtilsMessengerCreateInfoEXT, .{});
-        const enabled_layers: []const [*c]const u8 = &validation_layers;
         if (enable_validation_layers) {
-            create_info.enabledLayerCount = @intCast(enabled_layers.len);
-            create_info.ppEnabledLayerNames = enabled_layers.ptr;
+            create_info.enabledLayerCount = @intCast(validation_layers.len);
+            create_info.ppEnabledLayerNames = &validation_layers;
 
             vk_dm.populate_debug_messenger_create_info(&debug_create_info);
             create_info.pNext = &debug_create_info;
@@ -145,7 +194,6 @@ pub const VulkanRenderer = struct {
     }
 
     fn setup_debug_messenger(self: *VulkanRenderer) !void {
-        // _ = self;
         if (!enable_validation_layers) {
             return;
         }
@@ -227,14 +275,12 @@ pub const VulkanRenderer = struct {
         create_info.pQueueCreateInfos = queue_create_infos.items.ptr;
         create_info.queueCreateInfoCount = @intCast(queue_create_infos.items.len);
         create_info.pEnabledFeatures = &device_features;
-        const enabled_extensions: []const [*c]const u8 = &device_extensions;
-        create_info.enabledExtensionCount = @intCast(enabled_extensions.len);
-        create_info.ppEnabledExtensionNames = enabled_extensions.ptr;
+        create_info.enabledExtensionCount = @intCast(device_extensions.len);
+        create_info.ppEnabledExtensionNames = &device_extensions;
 
         if (enable_validation_layers) {
-            const enabled_layers: []const [*c]const u8 = &validation_layers;
-            create_info.enabledLayerCount = @intCast(enabled_layers.len);
-            create_info.ppEnabledLayerNames = enabled_layers.ptr;
+            create_info.enabledLayerCount = @intCast(validation_layers.len);
+            create_info.ppEnabledLayerNames = &validation_layers;
         } else {
             create_info.enabledLayerCount = 0;
         }
@@ -292,8 +338,7 @@ pub const VulkanRenderer = struct {
         create_info.compositeAlpha = c.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
         create_info.presentMode = present_mode;
         create_info.clipped = c.VK_TRUE;
-        // create_info.oldSwapchain = c.VK_NULL_HANDLE;
-        create_info.oldSwapchain = null;
+        create_info.oldSwapchain = @ptrCast(c.VK_NULL_HANDLE);
 
         if (c.vkCreateSwapchainKHR(self.device, &create_info, null, &self.swap_chain) != c.VK_SUCCESS) {
             std.log.err("Vulkan: failed to create swap chain!", .{});
@@ -305,22 +350,19 @@ pub const VulkanRenderer = struct {
             return error.Vulkan;
         }
 
-        const swap_chain_images = try self.allocator.alloc(c.VkImage, image_count);
-        // defer self.allocator.free(swap_chain_images);
+        self.swap_chain_images = try self.allocator.alloc(c.VkImage, image_count);
 
-        if (c.vkGetSwapchainImagesKHR(self.device, self.swap_chain, &image_count, swap_chain_images.ptr) != c.VK_SUCCESS) {
+        if (c.vkGetSwapchainImagesKHR(self.device, self.swap_chain, &image_count, self.swap_chain_images.ptr) != c.VK_SUCCESS) {
             std.log.err("Vulkan: failed to get swap chain images!", .{});
             return error.Vulkan;
         }
 
-        self.swap_chain_images = swap_chain_images;
         self.swap_chain_image_format = surface_format.format;
         self.swap_chain_extent = extent;
     }
 
     fn create_image_views(self: *VulkanRenderer) !void {
         self.swap_chain_image_views = try self.allocator.alloc(c.VkImageView, self.swap_chain_images.len);
-        // defer self.allocator.free(swap_chain_image_views);
 
         for (0..self.swap_chain_images.len) |i| {
             var create_info = c.VkImageViewCreateInfo{};
@@ -412,28 +454,24 @@ pub const VulkanRenderer = struct {
         frag_shader_stage_info.module = frag_shader_module;
         frag_shader_stage_info.pName = "main";
 
-        // const shader_stages = [_]c.VkPipelineShaderStageCreateInfo{ vert_shader_stage_info, frag_shader_stage_info };
-        var shader_stages = std.ArrayList(c.VkPipelineShaderStageCreateInfo).init(self.allocator);
-        defer shader_stages.deinit();
-        try shader_stages.append(vert_shader_stage_info);
-        try shader_stages.append(frag_shader_stage_info);
+        const shader_stages = [2]c.VkPipelineShaderStageCreateInfo{ vert_shader_stage_info, frag_shader_stage_info };
 
-        var dynamic_states = std.ArrayList(c.VkDynamicState).init(self.allocator);
-        defer dynamic_states.deinit();
-        try dynamic_states.append(c.VK_DYNAMIC_STATE_VIEWPORT);
-        try dynamic_states.append(c.VK_DYNAMIC_STATE_SCISSOR);
+        const dynamic_states = [2]c.VkDynamicState{ c.VK_DYNAMIC_STATE_VIEWPORT, c.VK_DYNAMIC_STATE_SCISSOR };
 
         var dynamic_state = c.VkPipelineDynamicStateCreateInfo{};
         dynamic_state.sType = c.VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-        dynamic_state.dynamicStateCount = @intCast(dynamic_states.items.len);
-        dynamic_state.pDynamicStates = @ptrCast(dynamic_states.items.ptr);
+        dynamic_state.dynamicStateCount = @intCast(dynamic_states.len);
+        dynamic_state.pDynamicStates = &dynamic_states;
+
+        var binding_description = try vk_vt.Vertex.get_binding_description();
+        var attribute_descriptions = try vk_vt.Vertex.get_attribute_descriptions();
 
         var vertex_input_info = c.VkPipelineVertexInputStateCreateInfo{};
         vertex_input_info.sType = c.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertex_input_info.vertexBindingDescriptionCount = 0;
-        vertex_input_info.pVertexBindingDescriptions = null; // optional
-        vertex_input_info.vertexAttributeDescriptionCount = 0;
-        vertex_input_info.pVertexAttributeDescriptions = null; // optional
+        vertex_input_info.vertexBindingDescriptionCount = 1;
+        vertex_input_info.pVertexBindingDescriptions = &binding_description;
+        vertex_input_info.vertexAttributeDescriptionCount = @intCast(attribute_descriptions.len);
+        vertex_input_info.pVertexAttributeDescriptions = &attribute_descriptions;
 
         var input_assembly = c.VkPipelineInputAssemblyStateCreateInfo{};
         input_assembly.sType = c.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -512,7 +550,7 @@ pub const VulkanRenderer = struct {
         var pipeline_info = c.VkGraphicsPipelineCreateInfo{};
         pipeline_info.sType = c.VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
         pipeline_info.stageCount = 2;
-        pipeline_info.pStages = shader_stages.items.ptr;
+        pipeline_info.pStages = &shader_stages;
         pipeline_info.pVertexInputState = &vertex_input_info;
         pipeline_info.pInputAssemblyState = &input_assembly;
         pipeline_info.pViewportState = &viewport_state;
@@ -537,15 +575,13 @@ pub const VulkanRenderer = struct {
         self.swap_chain_framebuffers = try self.allocator.alloc(c.VkFramebuffer, self.swap_chain_image_views.len);
 
         for (0..self.swap_chain_image_views.len) |i| {
-            var attachments = std.ArrayList(c.VkImageView).init(self.allocator);
-            defer attachments.deinit();
-            try attachments.append(self.swap_chain_image_views[i]);
+            const attachments = [1]c.VkImageView{self.swap_chain_image_views[i]};
 
             var framebuffer_info = c.VkFramebufferCreateInfo{};
             framebuffer_info.sType = c.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
             framebuffer_info.renderPass = self.render_pass;
             framebuffer_info.attachmentCount = 1;
-            framebuffer_info.pAttachments = attachments.items.ptr;
+            framebuffer_info.pAttachments = &attachments;
             framebuffer_info.width = self.swap_chain_extent.width;
             framebuffer_info.height = self.swap_chain_extent.height;
             framebuffer_info.layers = 1;
@@ -573,20 +609,62 @@ pub const VulkanRenderer = struct {
         }
     }
 
-    fn create_command_buffer(self: *VulkanRenderer) !void {
+    fn create_vextex_buffer(self: *VulkanRenderer) !void {
+        var buffer_info = c.VkBufferCreateInfo{};
+        buffer_info.sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        buffer_info.size = @sizeOf(@TypeOf(vertices[0])) * vertices.len;
+        buffer_info.usage = c.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        buffer_info.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
+
+        if (c.vkCreateBuffer(self.device, &buffer_info, null, &self.vertex_buffer) != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to create vertex buffer!", .{});
+        }
+
+        var mem_requirements: c.VkMemoryRequirements = undefined;
+        c.vkGetBufferMemoryRequirements(self.device, self.vertex_buffer, &mem_requirements);
+
+        var alloc_info = c.VkMemoryAllocateInfo{};
+        alloc_info.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        alloc_info.allocationSize = mem_requirements.size;
+        alloc_info.memoryTypeIndex = try find_memory_type(
+            mem_requirements.memoryTypeBits,
+            c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            self.physical_device,
+        );
+
+        if (c.vkAllocateMemory(self.device, &alloc_info, null, &self.vertex_buffer_memory) != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to allocate vertex buffer memory!", .{});
+            return error.Vulkan;
+        }
+
+        _ = c.vkBindBufferMemory(self.device, self.vertex_buffer, self.vertex_buffer_memory, 0);
+
+        var data: ?*anyopaque = undefined;
+        _ = c.vkMapMemory(self.device, self.vertex_buffer_memory, 0, buffer_info.size, 0, &data);
+        std.mem.copyForwards(u8, @as([*]u8, @ptrCast(data.?))[0..buffer_info.size], std.mem.sliceAsBytes(&vertices));
+        c.vkUnmapMemory(self.device, self.vertex_buffer_memory);
+    }
+
+    fn create_command_buffers(self: *VulkanRenderer) !void {
+        self.command_buffers = try self.allocator.alloc(c.VkCommandBuffer, MAX_FRAME_IN_FLIGHT);
+
         var alloc_info = c.VkCommandBufferAllocateInfo{};
         alloc_info.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         alloc_info.commandPool = self.command_pool;
         alloc_info.level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        alloc_info.commandBufferCount = 1;
+        alloc_info.commandBufferCount = @intCast(self.command_buffers.len);
 
-        if (c.vkAllocateCommandBuffers(self.device, &alloc_info, &self.command_buffer) != c.VK_SUCCESS) {
+        if (c.vkAllocateCommandBuffers(self.device, &alloc_info, self.command_buffers.ptr) != c.VK_SUCCESS) {
             std.log.err("Vulkan: failed to allocate command buffers!", .{});
             return error.Vulkan;
         }
     }
 
     fn create_sync_objects(self: *VulkanRenderer) !void {
+        self.image_available_semaphores = try self.allocator.alloc(c.VkSemaphore, MAX_FRAME_IN_FLIGHT);
+        self.render_finished_semaphores = try self.allocator.alloc(c.VkSemaphore, MAX_FRAME_IN_FLIGHT);
+        self.in_flight_fences = try self.allocator.alloc(c.VkFence, MAX_FRAME_IN_FLIGHT);
+
         var semaphore_info = c.VkSemaphoreCreateInfo{};
         semaphore_info.sType = c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
@@ -594,60 +672,66 @@ pub const VulkanRenderer = struct {
         fence_info.sType = c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         fence_info.flags = c.VK_FENCE_CREATE_SIGNALED_BIT;
 
-        if (c.vkCreateSemaphore(self.device, &semaphore_info, null, &self.image_available_semaphore) != c.VK_SUCCESS or
-            c.vkCreateSemaphore(self.device, &semaphore_info, null, &self.render_finished_semaphore) != c.VK_SUCCESS or
-            c.vkCreateFence(self.device, &fence_info, null, &self.in_flight_fence) != c.VK_SUCCESS)
-        {
-            std.log.err("Vulkan: failed to create semaphores!", .{});
-            return error.Vulkan;
+        for (0..MAX_FRAME_IN_FLIGHT) |i| {
+            if (c.vkCreateSemaphore(self.device, &semaphore_info, null, &self.image_available_semaphores[i]) != c.VK_SUCCESS or
+                c.vkCreateSemaphore(self.device, &semaphore_info, null, &self.render_finished_semaphores[i]) != c.VK_SUCCESS or
+                c.vkCreateFence(self.device, &fence_info, null, &self.in_flight_fences[i]) != c.VK_SUCCESS)
+            {
+                std.log.err("Vulkan: failed to create semaphores!", .{});
+                return error.Vulkan;
+            }
         }
     }
 
     pub fn draw_frame(self: *VulkanRenderer) !void {
-        if (c.vkWaitForFences(self.device, 1, &self.in_flight_fence, c.VK_TRUE, std.math.maxInt(u64)) != c.VK_SUCCESS) {
-            std.log.err("Vulkan: failed to wait for fence!", .{});
-            return error.Vulkan;
-        }
-
-        if (c.vkResetFences(self.device, 1, &self.in_flight_fence) != c.VK_SUCCESS) {
-            std.log.err("Vulkan: failed to reset for fences!", .{});
-            return error.Vulkan;
-        }
+        _ = c.vkWaitForFences(self.device, 1, &self.in_flight_fences[self.current_frame], c.VK_TRUE, std.math.maxInt(u64));
 
         var image_index: u32 = 0;
 
-        _ = c.vkAcquireNextImageKHR(self.device, self.swap_chain, std.math.maxInt(u64), self.image_available_semaphore, @ptrCast(c.VK_NULL_HANDLE), &image_index);
+        var result = c.vkAcquireNextImageKHR(self.device, self.swap_chain, std.math.maxInt(u64), self.image_available_semaphores[self.current_frame], @ptrCast(c.VK_NULL_HANDLE), &image_index);
 
-        _ = c.vkResetCommandBuffer(self.command_buffer, 0);
+        if (result == c.VK_ERROR_OUT_OF_DATE_KHR) {
+            try self.recreate_swap_chain();
+            return;
+        } else if (result != c.VK_SUCCESS and result != c.VK_SUBOPTIMAL_KHR) {
+            std.log.err("Vulkan: failed to acquire swap chain image!", .{});
+            return error.Vulkan;
+        }
+
+        _ = c.vkResetFences(self.device, 1, &self.in_flight_fences[self.current_frame]);
+
+        _ = c.vkResetCommandBuffer(self.command_buffers[self.current_frame], 0);
 
         try vk_cb.record_command_buffer(
-            self.command_buffer,
+            self.command_buffers[self.current_frame],
             image_index,
             self.render_pass,
             self.swap_chain_framebuffers,
             self.swap_chain_extent,
             self.graphics_pipeline,
+            self.vertex_buffer,
+            &vertices,
         );
 
         var submit_info = c.VkSubmitInfo{};
         submit_info.sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO;
 
-        var wait_semaphores = [1]c.VkSemaphore{self.image_available_semaphore};
+        var wait_semaphores = [1]c.VkSemaphore{self.image_available_semaphores[self.current_frame]};
+
         var wait_stages = [1]c.VkPipelineStageFlags{c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
+
         submit_info.waitSemaphoreCount = 1;
         submit_info.pWaitSemaphores = &wait_semaphores;
         submit_info.pWaitDstStageMask = &wait_stages;
         submit_info.commandBufferCount = 1;
-        submit_info.pCommandBuffers = &self.command_buffer;
+        submit_info.pCommandBuffers = &self.command_buffers[self.current_frame];
 
-        // const signal_semaphore = [1]c.VkSemaphore{self.render_finished_semaphore};
-        var signal_semaphore = std.ArrayList(c.VkSemaphore).init(self.allocator);
-        defer signal_semaphore.deinit();
-        try signal_semaphore.append(self.render_finished_semaphore);
+        var signal_semaphore = [1]c.VkSemaphore{self.render_finished_semaphores[self.current_frame]};
+
         submit_info.signalSemaphoreCount = 1;
-        submit_info.pSignalSemaphores = signal_semaphore.items.ptr;
+        submit_info.pSignalSemaphores = &signal_semaphore;
 
-        if (c.vkQueueSubmit(self.graphics_queue, 1, &submit_info, self.in_flight_fence) != c.VK_SUCCESS) {
+        if (c.vkQueueSubmit(self.graphics_queue, 1, &submit_info, self.in_flight_fences[self.current_frame]) != c.VK_SUCCESS) {
             std.log.err("Vulkan: failed to submit draw command buffer!", .{});
             return error.Vulkan;
         }
@@ -655,18 +739,43 @@ pub const VulkanRenderer = struct {
         var present_info = c.VkPresentInfoKHR{};
         present_info.sType = c.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         present_info.waitSemaphoreCount = 1;
-        present_info.pWaitSemaphores = signal_semaphore.items.ptr;
+        present_info.pWaitSemaphores = &signal_semaphore;
 
-        // var swap_chains = [1]c.VkSwapchainKHR{self.swap_chain};
-        var swap_chains = std.ArrayList(c.VkSwapchainKHR).init(self.allocator);
-        defer swap_chains.deinit();
-        try swap_chains.append(self.swap_chain);
+        const swap_chains = [1]c.VkSwapchainKHR{self.swap_chain};
 
         present_info.swapchainCount = 1;
-        present_info.pSwapchains = swap_chains.items.ptr;
+        present_info.pSwapchains = &swap_chains;
         present_info.pImageIndices = &image_index;
         present_info.pResults = null; // Optional
 
-        _ = c.vkQueuePresentKHR(self.present_queue, &present_info);
+        result = c.vkQueuePresentKHR(self.present_queue, &present_info);
+
+        if (result == c.VK_ERROR_OUT_OF_DATE_KHR or result == c.VK_SUBOPTIMAL_KHR or self.framebuffer_resized) {
+            self.framebuffer_resized = false;
+            try self.recreate_swap_chain();
+        } else if (result != c.VK_SUCCESS) {
+            std.log.err("Vulkan: failed to present swap chain image!", .{});
+            return error.Vulkan;
+        }
+
+        self.current_frame = (self.current_frame + 1) % MAX_FRAME_IN_FLIGHT;
     }
 };
+
+fn find_memory_type(
+    type_filter: u32,
+    properties: c.VkMemoryPropertyFlags,
+    physical_device: c.VkPhysicalDevice,
+) !u32 {
+    var mem_properties: c.VkPhysicalDeviceMemoryProperties = undefined;
+    c.vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_properties);
+
+    for (0..mem_properties.memoryTypeCount) |i| {
+        if ((type_filter & (@as(u32, 1) << @truncate(i))) != 0 and (mem_properties.memoryTypes[i].propertyFlags & properties) == properties) {
+            return @truncate(i);
+        }
+    }
+
+    std.log.err("Vulkan: failed to find suitable memory type!", .{});
+    return error.Vulkan;
+}
