@@ -81,7 +81,9 @@ pub fn record_command_buffer(
     swap_chain_extent: c.VkExtent2D,
     graphics_pipeline: c.VkPipeline,
     vertex_buffer: c.VkBuffer,
-    vertices: []Vertex,
+    index_buffer: c.VkBuffer,
+    indices: []u32,
+    // vertices: []Vertex,
 ) !void {
     var begin_info = c.VkCommandBufferBeginInfo{};
     begin_info.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -133,7 +135,10 @@ pub fn record_command_buffer(
 
     c.vkCmdBindVertexBuffers(command_buffer, 0, 1, &vertex_buffers, &offsets);
 
-    c.vkCmdDraw(command_buffer, @intCast(vertices.len), 1, 0, 0);
+    c.vkCmdBindIndexBuffer(command_buffer, index_buffer, 0, c.VK_INDEX_TYPE_UINT32);
+
+    // c.vkCmdDraw(command_buffer, @intCast(vertices.len), 1, 0, 0);
+    c.vkCmdDrawIndexed(command_buffer, @intCast(indices.len), 1, 0, 0, 0);
 
     c.vkCmdEndRenderPass(command_buffer);
 
@@ -422,4 +427,86 @@ pub fn find_memory_type(
 
     std.log.err("Vulkan: failed to find suitable memory type!", .{});
     return error.Vulkan;
+}
+
+pub fn create_buffer(
+    size: c.VkDeviceSize,
+    usage: c.VkBufferUsageFlags,
+    properties: c.VkMemoryPropertyFlags,
+    buffer: *c.VkBuffer,
+    buffer_memory: *c.VkDeviceMemory,
+    device: c.VkDevice,
+    physical_device: c.VkPhysicalDevice,
+) !void {
+    var buffer_info = c.VkBufferCreateInfo{};
+    buffer_info.sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = size;
+    buffer_info.usage = usage;
+    buffer_info.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
+
+    if (c.vkCreateBuffer(device, &buffer_info, null, &buffer.*) != c.VK_SUCCESS) {
+        std.log.err("Vulkan: failed to create vertex buffer!", .{});
+    }
+
+    var mem_requirements: c.VkMemoryRequirements = undefined;
+    c.vkGetBufferMemoryRequirements(device, buffer.*, &mem_requirements);
+
+    var alloc_info = c.VkMemoryAllocateInfo{};
+    alloc_info.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    alloc_info.allocationSize = mem_requirements.size;
+    alloc_info.memoryTypeIndex = try find_memory_type(
+        mem_requirements.memoryTypeBits,
+        properties,
+        physical_device,
+    );
+
+    if (c.vkAllocateMemory(device, &alloc_info, null, &buffer_memory.*) != c.VK_SUCCESS) {
+        std.log.err("Vulkan: failed to allocate vertex buffer memory!", .{});
+        return error.Vulkan;
+    }
+
+    _ = c.vkBindBufferMemory(device, buffer.*, buffer_memory.*, 0);
+}
+
+pub fn copy_buffer(
+    src_buffer: c.VkBuffer,
+    dst_buffer: c.VkBuffer,
+    size: c.VkDeviceSize,
+    command_pool: c.VkCommandPool,
+    device: c.VkDevice,
+    graphics_queue: c.VkQueue,
+) !void {
+    var alloc_info = c.VkCommandBufferAllocateInfo{};
+    alloc_info.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    alloc_info.level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc_info.commandPool = command_pool;
+    alloc_info.commandBufferCount = 1;
+
+    var command_buffer: c.VkCommandBuffer = undefined;
+    _ = c.vkAllocateCommandBuffers(device, &alloc_info, &command_buffer);
+
+    var begin_info = c.VkCommandBufferBeginInfo{};
+    begin_info.sType = c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    _ = c.vkBeginCommandBuffer(command_buffer, &begin_info);
+
+    var copy_region = c.VkBufferCopy{};
+    copy_region.srcOffset = 0; // Optional
+    copy_region.dstOffset = 0; // Optional
+    copy_region.size = size;
+
+    c.vkCmdCopyBuffer(command_buffer, src_buffer, dst_buffer, 1, &copy_region);
+
+    _ = c.vkEndCommandBuffer(command_buffer);
+
+    var submit_info = c.VkSubmitInfo{};
+    submit_info.sType = c.VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &command_buffer;
+
+    _ = c.vkQueueSubmit(graphics_queue, 1, &submit_info, @ptrCast(c.VK_NULL_HANDLE));
+    _ = c.vkQueueWaitIdle(graphics_queue);
+
+    c.vkFreeCommandBuffers(device, command_pool, 1, &command_buffer);
 }

@@ -42,12 +42,17 @@ pub const VulkanRenderer = struct {
 
     vertex_buffer: c.VkBuffer,
     vertex_buffer_memory: c.VkDeviceMemory,
+    index_buffer: c.VkBuffer,
+    index_buffer_memory: c.VkDeviceMemory,
 
-    var vertices = [3]vk_hp.Vertex{
-        .{ .pos = .{ 0.0, -0.5 }, .color = .{ 1, 0, 0 } },
-        .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0, 1, 0 } },
-        .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0, 0, 1 } },
+    var vertices = [_]vk_hp.Vertex{
+        .{ .pos = .{ -0.5, -0.5 }, .color = .{ 1, 0, 0 } },
+        .{ .pos = .{ 0.5, -0.5 }, .color = .{ 0, 1, 0 } },
+        .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0, 0, 1 } },
+        .{ .pos = .{ -0.5, 0.5 }, .color = .{ 1, 1, 1 } },
     };
+
+    var indices = [_]u32{ 0, 1, 2, 2, 3, 0 };
 
     pub fn init(allocator: std.mem.Allocator) !VulkanRenderer {
         return std.mem.zeroInit(VulkanRenderer, .{
@@ -60,6 +65,9 @@ pub const VulkanRenderer = struct {
     // cleanup
     pub fn deinit(self: *VulkanRenderer) void {
         self.cleanup_swap_chain() catch @panic("Vulkan: error cleaning swap chain!");
+
+        c.vkDestroyBuffer(self.device, self.index_buffer, null);
+        c.vkFreeMemory(self.device, self.index_buffer_memory, null);
 
         c.vkDestroyBuffer(self.device, self.vertex_buffer, null);
         c.vkFreeMemory(self.device, self.vertex_buffer_memory, null);
@@ -104,6 +112,7 @@ pub const VulkanRenderer = struct {
         try self.create_framebuffers();
         try self.create_command_pool();
         try self.create_vextex_buffer();
+        try self.create_index_buffer();
         try self.create_command_buffers();
         try self.create_sync_objects();
     }
@@ -236,7 +245,7 @@ pub const VulkanRenderer = struct {
     }
 
     fn create_logical_device(self: *VulkanRenderer) !void {
-        const indices = try vk_hp.find_queue_families(self.allocator, self.physical_device, self.surface);
+        const queue_indices = try vk_hp.find_queue_families(self.allocator, self.physical_device, self.surface);
 
         var queue_create_infos = std.ArrayList(c.VkDeviceQueueCreateInfo).init(self.allocator);
         defer queue_create_infos.deinit();
@@ -244,10 +253,10 @@ pub const VulkanRenderer = struct {
         var unique_queue_families = std.ArrayList(u32).init(self.allocator);
         defer unique_queue_families.deinit();
 
-        if (indices.graphics_family) |graphics_family| {
+        if (queue_indices.graphics_family) |graphics_family| {
             try unique_queue_families.append(graphics_family);
         }
-        if (indices.present_family) |present_family| {
+        if (queue_indices.present_family) |present_family| {
             try unique_queue_families.append(present_family);
         }
 
@@ -283,10 +292,10 @@ pub const VulkanRenderer = struct {
             return error.Vulkan;
         }
 
-        if (indices.graphics_family) |graphics_family| {
+        if (queue_indices.graphics_family) |graphics_family| {
             c.vkGetDeviceQueue(self.device, graphics_family, 0, &self.graphics_queue);
         }
-        if (indices.present_family) |present_family| {
+        if (queue_indices.present_family) |present_family| {
             c.vkGetDeviceQueue(self.device, present_family, 0, &self.present_queue);
         }
     }
@@ -313,11 +322,11 @@ pub const VulkanRenderer = struct {
         create_info.imageArrayLayers = 1;
         create_info.imageUsage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
-        const indices = try vk_hp.find_queue_families(self.allocator, self.physical_device, self.surface);
+        const queue_indices = try vk_hp.find_queue_families(self.allocator, self.physical_device, self.surface);
 
-        const queue_family_indices = [_]u32{ indices.graphics_family.?, indices.present_family.? };
+        const queue_family_indices = [_]u32{ queue_indices.graphics_family.?, queue_indices.present_family.? };
 
-        if (indices.graphics_family != indices.present_family) {
+        if (queue_indices.graphics_family != queue_indices.present_family) {
             create_info.imageSharingMode = c.VK_SHARING_MODE_CONCURRENT;
             create_info.queueFamilyIndexCount = 2;
             create_info.pQueueFamilyIndices = &queue_family_indices;
@@ -603,39 +612,95 @@ pub const VulkanRenderer = struct {
     }
 
     fn create_vextex_buffer(self: *VulkanRenderer) !void {
-        var buffer_info = c.VkBufferCreateInfo{};
-        buffer_info.sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        buffer_info.size = @sizeOf(@TypeOf(vertices[0])) * vertices.len;
-        buffer_info.usage = c.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-        buffer_info.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
+        const buffer_size: c.VkDeviceSize = @sizeOf(@TypeOf(vertices[0])) * vertices.len;
 
-        if (c.vkCreateBuffer(self.device, &buffer_info, null, &self.vertex_buffer) != c.VK_SUCCESS) {
-            std.log.err("Vulkan: failed to create vertex buffer!", .{});
-        }
+        var staging_buffer: c.VkBuffer = undefined;
+        var stagind_buffer_memory: c.VkDeviceMemory = undefined;
 
-        var mem_requirements: c.VkMemoryRequirements = undefined;
-        c.vkGetBufferMemoryRequirements(self.device, self.vertex_buffer, &mem_requirements);
-
-        var alloc_info = c.VkMemoryAllocateInfo{};
-        alloc_info.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        alloc_info.allocationSize = mem_requirements.size;
-        alloc_info.memoryTypeIndex = try vk_hp.find_memory_type(
-            mem_requirements.memoryTypeBits,
+        try vk_hp.create_buffer(
+            buffer_size,
+            c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging_buffer,
+            &stagind_buffer_memory,
+            self.device,
             self.physical_device,
         );
 
-        if (c.vkAllocateMemory(self.device, &alloc_info, null, &self.vertex_buffer_memory) != c.VK_SUCCESS) {
-            std.log.err("Vulkan: failed to allocate vertex buffer memory!", .{});
-            return error.Vulkan;
-        }
+        var data: ?*anyopaque = undefined;
+        _ = c.vkMapMemory(self.device, stagind_buffer_memory, 0, buffer_size, 0, &data);
 
-        _ = c.vkBindBufferMemory(self.device, self.vertex_buffer, self.vertex_buffer_memory, 0);
+        std.mem.copyForwards(u8, @as([*]u8, @ptrCast(data.?))[0..buffer_size], std.mem.sliceAsBytes(&vertices));
+
+        c.vkUnmapMemory(self.device, stagind_buffer_memory);
+
+        try vk_hp.create_buffer(
+            buffer_size,
+            c.VK_BUFFER_USAGE_TRANSFER_DST_BIT | c.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            &self.vertex_buffer,
+            &self.vertex_buffer_memory,
+            self.device,
+            self.physical_device,
+        );
+
+        try vk_hp.copy_buffer(
+            staging_buffer,
+            self.vertex_buffer,
+            buffer_size,
+            self.command_pool,
+            self.device,
+            self.graphics_queue,
+        );
+
+        c.vkDestroyBuffer(self.device, staging_buffer, null);
+        c.vkFreeMemory(self.device, stagind_buffer_memory, null);
+    }
+
+    fn create_index_buffer(self: *VulkanRenderer) !void {
+        const buffer_size: c.VkDeviceSize = @sizeOf(@TypeOf(indices[0])) * indices.len;
+
+        var staging_buffer: c.VkBuffer = undefined;
+        var stagind_buffer_memory: c.VkDeviceMemory = undefined;
+
+        try vk_hp.create_buffer(
+            buffer_size,
+            c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            &staging_buffer,
+            &stagind_buffer_memory,
+            self.device,
+            self.physical_device,
+        );
 
         var data: ?*anyopaque = undefined;
-        _ = c.vkMapMemory(self.device, self.vertex_buffer_memory, 0, buffer_info.size, 0, &data);
-        std.mem.copyForwards(u8, @as([*]u8, @ptrCast(data.?))[0..buffer_info.size], std.mem.sliceAsBytes(&vertices));
-        c.vkUnmapMemory(self.device, self.vertex_buffer_memory);
+        _ = c.vkMapMemory(self.device, stagind_buffer_memory, 0, buffer_size, 0, &data);
+
+        std.mem.copyForwards(u8, @as([*]u8, @ptrCast(data.?))[0..buffer_size], std.mem.sliceAsBytes(&indices));
+
+        c.vkUnmapMemory(self.device, stagind_buffer_memory);
+
+        try vk_hp.create_buffer(
+            buffer_size,
+            c.VK_BUFFER_USAGE_TRANSFER_DST_BIT | c.VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+            c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            &self.index_buffer,
+            &self.index_buffer_memory,
+            self.device,
+            self.physical_device,
+        );
+
+        try vk_hp.copy_buffer(
+            staging_buffer,
+            self.index_buffer,
+            buffer_size,
+            self.command_pool,
+            self.device,
+            self.graphics_queue,
+        );
+
+        c.vkDestroyBuffer(self.device, staging_buffer, null);
+        c.vkFreeMemory(self.device, stagind_buffer_memory, null);
     }
 
     fn create_command_buffers(self: *VulkanRenderer) !void {
@@ -703,7 +768,9 @@ pub const VulkanRenderer = struct {
             self.swap_chain_extent,
             self.graphics_pipeline,
             self.vertex_buffer,
-            &vertices,
+            self.index_buffer,
+            // &vertices,
+            &indices,
         );
 
         var submit_info = c.VkSubmitInfo{};
