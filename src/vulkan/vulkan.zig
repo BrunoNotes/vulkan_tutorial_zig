@@ -2,14 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("../c.zig").c;
 
-const vk_dm = @import("debug_messenger.zig");
-const vk_ins = @import("instance.zig");
-const vk_phd = @import("physical_device.zig");
-const vk_ld = @import("logical_device.zig");
-const vk_sc = @import("swap_chain.zig");
-const vk_sd = @import("shader.zig");
-const vk_cb = @import("command_buffer.zig");
-const vk_vt = @import("vertex.zig");
+const vk_hp = @import("helpers.zig");
 const util = @import("../util/file.zig");
 
 pub const validation_layers = [_][*c]const u8{"VK_LAYER_KHRONOS_validation"};
@@ -50,7 +43,7 @@ pub const VulkanRenderer = struct {
     vertex_buffer: c.VkBuffer,
     vertex_buffer_memory: c.VkDeviceMemory,
 
-    var vertices = [3]vk_vt.Vertex{
+    var vertices = [3]vk_hp.Vertex{
         .{ .pos = .{ 0.0, -0.5 }, .color = .{ 1, 0, 0 } },
         .{ .pos = .{ 0.5, 0.5 }, .color = .{ 0, 1, 0 } },
         .{ .pos = .{ -0.5, 0.5 }, .color = .{ 0, 0, 1 } },
@@ -87,7 +80,7 @@ pub const VulkanRenderer = struct {
         c.vkDestroyDevice(self.device, null);
 
         if (enable_validation_layers) {
-            vk_dm.destroy_debug_util_messenger_ext(self.instance, self.debug_messenger, null);
+            vk_hp.destroy_debug_util_messenger_ext(self.instance, self.debug_messenger, null);
         }
 
         c.vkDestroySurfaceKHR(self.instance, self.surface, null);
@@ -150,7 +143,7 @@ pub const VulkanRenderer = struct {
     }
 
     pub fn create_instance(self: *VulkanRenderer) !void {
-        const validation_layer_support = try vk_ins.check_validation_layer_support(self.allocator);
+        const validation_layer_support = try vk_hp.check_validation_layer_support(self.allocator);
         if (enable_validation_layers and !validation_layer_support) {
             std.log.err("Vulkan: Validation layers requested, but not available!", .{});
             return error.Vulkan;
@@ -165,7 +158,7 @@ pub const VulkanRenderer = struct {
             .apiVersion = c.VK_API_VERSION_1_3,
         };
 
-        const required_extensions = try vk_ins.get_required_extensions(self.allocator);
+        const required_extensions = try vk_hp.get_required_extensions(self.allocator);
         defer required_extensions.deinit();
 
         var create_info = c.VkInstanceCreateInfo{
@@ -180,7 +173,7 @@ pub const VulkanRenderer = struct {
             create_info.enabledLayerCount = @intCast(validation_layers.len);
             create_info.ppEnabledLayerNames = &validation_layers;
 
-            vk_dm.populate_debug_messenger_create_info(&debug_create_info);
+            vk_hp.populate_debug_messenger_create_info(&debug_create_info);
             create_info.pNext = &debug_create_info;
         } else {
             create_info.enabledLayerCount = 0;
@@ -199,9 +192,9 @@ pub const VulkanRenderer = struct {
         }
 
         var create_info = std.mem.zeroInit(c.VkDebugUtilsMessengerCreateInfoEXT, .{});
-        vk_dm.populate_debug_messenger_create_info(&create_info);
+        vk_hp.populate_debug_messenger_create_info(&create_info);
 
-        const create_debug_util = vk_dm.create_debug_util_messenger_ext(self.instance, &create_info, null, &self.debug_messenger);
+        const create_debug_util = vk_hp.create_debug_util_messenger_ext(self.instance, &create_info, null, &self.debug_messenger);
         if (create_debug_util != c.VK_SUCCESS) {
             std.log.err("Vulkan: Failed to set up debug messenger!", .{});
             return error.Vulkan;
@@ -229,7 +222,7 @@ pub const VulkanRenderer = struct {
         _ = c.vkEnumeratePhysicalDevices(self.instance, &device_count, devices.ptr);
 
         for (devices) |device| {
-            if (try vk_phd.is_device_suitable(self.allocator, device, self.surface)) {
+            if (try vk_hp.is_device_suitable(self.allocator, device, self.surface)) {
                 // self.physical_device = self.allocator.dupe(c.VkPhysicalDevice, device);
                 self.physical_device = device;
                 break;
@@ -243,7 +236,7 @@ pub const VulkanRenderer = struct {
     }
 
     fn create_logical_device(self: *VulkanRenderer) !void {
-        const indices = try vk_ld.find_queue_families(self.allocator, self.physical_device, self.surface);
+        const indices = try vk_hp.find_queue_families(self.allocator, self.physical_device, self.surface);
 
         var queue_create_infos = std.ArrayList(c.VkDeviceQueueCreateInfo).init(self.allocator);
         defer queue_create_infos.deinit();
@@ -299,11 +292,11 @@ pub const VulkanRenderer = struct {
     }
 
     fn create_swap_chain(self: *VulkanRenderer) !void {
-        const swap_chain_support = try vk_sc.query_swapchain_support(self.allocator, self.physical_device, self.surface);
+        const swap_chain_support = try vk_hp.query_swapchain_support(self.allocator, self.physical_device, self.surface);
 
-        const surface_format = vk_sc.choose_swap_surface_format(swap_chain_support.formats);
-        const present_mode = vk_sc.choose_swap_present_mode(swap_chain_support.present_modes);
-        const extent = vk_sc.choose_swap_extent(swap_chain_support.capabilities, self.window);
+        const surface_format = vk_hp.choose_swap_surface_format(swap_chain_support.formats);
+        const present_mode = vk_hp.choose_swap_present_mode(swap_chain_support.present_modes);
+        const extent = vk_hp.choose_swap_extent(swap_chain_support.capabilities, self.window);
 
         var image_count = swap_chain_support.capabilities.minImageCount + 1;
         if (swap_chain_support.capabilities.maxImageCount > 0 and image_count > swap_chain_support.capabilities.maxImageCount) {
@@ -320,7 +313,7 @@ pub const VulkanRenderer = struct {
         create_info.imageArrayLayers = 1;
         create_info.imageUsage = c.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 
-        const indices = try vk_phd.find_queue_families(self.allocator, self.physical_device, self.surface);
+        const indices = try vk_hp.find_queue_families(self.allocator, self.physical_device, self.surface);
 
         const queue_family_indices = [_]u32{ indices.graphics_family.?, indices.present_family.? };
 
@@ -435,8 +428,8 @@ pub const VulkanRenderer = struct {
         const vert_shader_code = try util.read_file(self.allocator, "shaders/compiled/triangle.vert.spv");
         const frag_shader_code = try util.read_file(self.allocator, "shaders/compiled/triangle.frag.spv");
 
-        const vert_shader_module = try vk_sd.create_shader_module(self.device, vert_shader_code);
-        const frag_shader_module = try vk_sd.create_shader_module(self.device, frag_shader_code);
+        const vert_shader_module = try vk_hp.create_shader_module(self.device, vert_shader_code);
+        const frag_shader_module = try vk_hp.create_shader_module(self.device, frag_shader_code);
         defer {
             c.vkDestroyShaderModule(self.device, vert_shader_module, null);
             c.vkDestroyShaderModule(self.device, frag_shader_module, null);
@@ -463,8 +456,8 @@ pub const VulkanRenderer = struct {
         dynamic_state.dynamicStateCount = @intCast(dynamic_states.len);
         dynamic_state.pDynamicStates = &dynamic_states;
 
-        var binding_description = try vk_vt.Vertex.get_binding_description();
-        var attribute_descriptions = try vk_vt.Vertex.get_attribute_descriptions();
+        var binding_description = try vk_hp.Vertex.get_binding_description();
+        var attribute_descriptions = try vk_hp.Vertex.get_attribute_descriptions();
 
         var vertex_input_info = c.VkPipelineVertexInputStateCreateInfo{};
         vertex_input_info.sType = c.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -594,7 +587,7 @@ pub const VulkanRenderer = struct {
     }
 
     fn create_command_pool(self: *VulkanRenderer) !void {
-        const queue_family_indices = try vk_ld.find_queue_families(self.allocator, self.physical_device, self.surface);
+        const queue_family_indices = try vk_hp.find_queue_families(self.allocator, self.physical_device, self.surface);
 
         var pool_info = c.VkCommandPoolCreateInfo{};
         pool_info.sType = c.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -626,7 +619,7 @@ pub const VulkanRenderer = struct {
         var alloc_info = c.VkMemoryAllocateInfo{};
         alloc_info.sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         alloc_info.allocationSize = mem_requirements.size;
-        alloc_info.memoryTypeIndex = try find_memory_type(
+        alloc_info.memoryTypeIndex = try vk_hp.find_memory_type(
             mem_requirements.memoryTypeBits,
             c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
             self.physical_device,
@@ -702,7 +695,7 @@ pub const VulkanRenderer = struct {
 
         _ = c.vkResetCommandBuffer(self.command_buffers[self.current_frame], 0);
 
-        try vk_cb.record_command_buffer(
+        try vk_hp.record_command_buffer(
             self.command_buffers[self.current_frame],
             image_index,
             self.render_pass,
@@ -761,21 +754,3 @@ pub const VulkanRenderer = struct {
         self.current_frame = (self.current_frame + 1) % MAX_FRAME_IN_FLIGHT;
     }
 };
-
-fn find_memory_type(
-    type_filter: u32,
-    properties: c.VkMemoryPropertyFlags,
-    physical_device: c.VkPhysicalDevice,
-) !u32 {
-    var mem_properties: c.VkPhysicalDeviceMemoryProperties = undefined;
-    c.vkGetPhysicalDeviceMemoryProperties(physical_device, &mem_properties);
-
-    for (0..mem_properties.memoryTypeCount) |i| {
-        if ((type_filter & (@as(u32, 1) << @truncate(i))) != 0 and (mem_properties.memoryTypes[i].propertyFlags & properties) == properties) {
-            return @truncate(i);
-        }
-    }
-
-    std.log.err("Vulkan: failed to find suitable memory type!", .{});
-    return error.Vulkan;
-}
